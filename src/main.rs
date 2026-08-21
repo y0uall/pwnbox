@@ -1,0 +1,1893 @@
+use std::collections::HashSet;
+use std::sync::LazyLock;
+use std::time::Instant;
+
+use anyhow::Result;
+use clap::Parser;
+use clap::builder::styling::{AnsiColor, Style, Styles};
+use colored::Colorize;
+use regex::Regex;
+use tokio::task::JoinHandle;
+use unicode_width::UnicodeWidthStr;
+
+// precompile these so we don't re-create them on every call
+static RE_OPEN_PORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(\d+)/(tcp|udp)\s+open").unwrap());
+// Matches "open" and UDP's "open|filtered" so udp ports aren't dropped.
+// Uses [ \t]/[^\n] rather than \s/. so the match stays on one line — otherwise a
+// version-less port line would let \s eat the newline and (.*) swallow the next
+// port line (in the regex crate \s matches \n).
+// Distinct from the scanners' `RE_PORT_LINE` prefix filter: this one captures the
+// port, proto, service and version fields for pretty-printing / JSON extraction.
+static RE_PORT_DETAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(\d+)/(tcp|udp)[ \t]+open(?:\|filtered)?[ \t]+(\S+)[ \t]*([^\n]*)").unwrap()
+});
+static RE_TCP_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+/tcp").unwrap());
+static RE_UDP_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+/udp").unwrap());
+
+mod config;
+mod hosts;
+mod report;
+mod runner;
+mod scans;
+mod tools;
+
+use config::{BoxConfig, FileConfig, ScanConfig};
+use report::Report;
+
+/// Tasteful colors for `--help` / `-h` and error output, themed to match
+/// pwnbox's own banner palette: magenta section headers, cyan flags, yellow
+/// values, green/red for valid/invalid suggestions.
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightMagenta.into())),
+        )
+        .usage(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightMagenta.into())),
+        )
+        .literal(Style::new().fg_color(Some(AnsiColor::BrightCyan.into())))
+        .placeholder(Style::new().fg_color(Some(AnsiColor::BrightYellow.into())))
+        .error(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightRed.into())),
+        )
+        .valid(Style::new().fg_color(Some(AnsiColor::BrightGreen.into())))
+        .invalid(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightRed.into())),
+        )
+}
+
+// ── `-h` / `--help` header art ──────────────────────────────────────────
+// "pwnbox" as a figlet "pagga" wordmark: 3 rows, each exactly LOGO_W display
+// columns, drawn with a smooth horizontal truecolor gradient. The colored
+// strings come from `colored`, which auto-strips ANSI when stdout isn't a TTY
+// (or NO_COLOR is set), so piped/redirected help degrades to plain block art.
+
+const LOGO: [&str; 3] = [
+    "░█▀█░█░█░█▀█░█▀▄░█▀█░█░█",
+    "░█▀▀░█▄█░█░█░█▀▄░█░█░▄▀▄",
+    "░▀░░░▀░▀░▀░▀░▀▀░░▀▀▀░▀░▀",
+];
+
+/// Gradient colour stops (green → cyan → violet) the wordmark is painted with.
+const GRADIENT: [(u8, u8, u8); 3] = [(80, 250, 123), (80, 211, 238), (199, 120, 221)];
+
+/// How much to darken the `░` filler cells so they read as a soft shadow
+/// behind the bright letters rather than competing with them (~1/3 intensity).
+const SHADOW_DIM: f32 = 0.34;
+
+/// Help layout: our colored banner, then usage/args, then the examples block.
+/// `{before-help}` is long-aware — it renders `before_long_help` for `--help`
+/// and `before_help` for `-h`. We drop `{about}` because the banner's tagline
+/// already carries it. clap pads `{before-help}` with a trailing blank line and
+/// `{after-help}` with a leading one, so we don't add those newlines ourselves.
+const HELP_TEMPLATE: &str = "\
+{before-help}{usage-heading} {usage}
+
+{all-args}{after-help}
+";
+
+/// Pick a colour `frac` (0.0..=1.0) of the way along the gradient stops.
+fn gradient_at(frac: f32) -> (u8, u8, u8) {
+    let n = GRADIENT.len();
+    if n == 1 || frac <= 0.0 {
+        return GRADIENT[0];
+    }
+    if frac >= 1.0 {
+        return GRADIENT[n - 1];
+    }
+    let seg_span = 1.0 / (n - 1) as f32;
+    let seg = ((frac / seg_span).floor() as usize).min(n - 2);
+    let local = (frac - seg as f32 * seg_span) / seg_span;
+    let (r0, g0, b0) = GRADIENT[seg];
+    let (r1, g1, b1) = GRADIENT[seg + 1];
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local).round() as u8;
+    (lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+/// Paint one wordmark row: solid glyphs (█ ▀ ▄) get the full horizontal
+/// gradient (lined up across all three rows by column), while the `░` filler
+/// cells get a darkened tint of the same column colour so they recede as a
+/// soft shadow instead of competing with the letters.
+fn gradient_row(line: &str) -> String {
+    let cols = line.chars().count().max(1);
+    let mut out = String::new();
+    for (i, ch) in line.chars().enumerate() {
+        let frac = i as f32 / (cols - 1).max(1) as f32;
+        let (r, g, b) = gradient_at(frac);
+        let painted = if ch == '░' {
+            let dim = |c: u8| (c as f32 * SHADOW_DIM) as u8;
+            ch.to_string().truecolor(dim(r), dim(g), dim(b)).to_string()
+        } else {
+            ch.to_string().truecolor(r, g, b).to_string()
+        };
+        out.push_str(&painted);
+    }
+    out
+}
+
+/// The colored header shown above `-h` (and, with `long`, `--help`) output:
+/// gradient wordmark + a one-line tagline (+ a short blurb for `--help`).
+fn help_banner(long: bool) -> String {
+    let mut lines: Vec<String> = LOGO
+        .iter()
+        .map(|row| format!("  {}", gradient_row(row)))
+        .collect();
+    lines.push(format!(
+        "  {} {} {} {} {} {} {} {}",
+        "⚡".bright_yellow(),
+        "Automated recon & enumeration".bright_white(),
+        "·".dimmed(),
+        "HackTheBox".bright_magenta().bold(),
+        "·".dimmed(),
+        format!("v{}", env!("CARGO_PKG_VERSION")).dimmed(),
+        "·".dimmed(),
+        // maker's mark — dimmed grey to match the version segment
+        "by uall".dimmed(),
+    ));
+    if long {
+        lines.push(String::new());
+        lines.push(format!(
+            "  {}",
+            "Runs a 6-phase pipeline: discovery → TCP/UDP → service & web enum,".dimmed(),
+        ));
+        lines.push(format!(
+            "  {}",
+            "writing a clean text report (plus optional JSON with --json).".dimmed(),
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The colored examples block shown below the args (clap `after_help`).
+fn help_examples() -> String {
+    // (command, description) — description "" means a bare example line.
+    const ROWS: [(&str, &str); 4] = [
+        ("pwnbox Lame 10.10.10.3", "full recon"),
+        (
+            "pwnbox Lame 10.10.10.3 --fast",
+            "quick TCP scan + web headers",
+        ),
+        ("pwnbox Lame 10.10.10.3 --skip smb,udp", ""),
+        ("pwnbox --init-config", "write a default config.toml"),
+    ];
+    // align descriptions just past the widest command that has one
+    let col = ROWS
+        .iter()
+        .filter(|(_, d)| !d.is_empty())
+        .map(|(c, _)| c.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    let mut s = format!("{}\n", "Examples:".bright_magenta().bold());
+    for (cmd, desc) in ROWS {
+        if desc.is_empty() {
+            s.push_str(&format!(
+                "  {} {}\n",
+                "▸".bright_cyan(),
+                cmd.bright_yellow()
+            ));
+        } else {
+            let pad = " ".repeat(col.saturating_sub(cmd.chars().count()));
+            s.push_str(&format!(
+                "  {} {}{}{}\n",
+                "▸".bright_cyan(),
+                cmd.bright_yellow(),
+                pad,
+                desc.dimmed(),
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "\n{}  {}",
+        "HackTheBox".bright_magenta().bold(),
+        "https://www.hackthebox.com/".bright_cyan().underline(),
+    ));
+    s
+}
+
+#[derive(Parser)]
+#[command(
+    name = "pwnbox",
+    version,
+    author = "uall",
+    about = "Automated recon & enumeration for HackTheBox",
+    before_help = help_banner(false),
+    before_long_help = help_banner(true),
+    after_help = help_examples(),
+    help_template = HELP_TEMPLATE,
+    styles = cli_styles(),
+    arg_required_else_help = true,
+    override_usage = "pwnbox [OPTIONS] <BOX> <IP>\n       pwnbox --init-config",
+)]
+struct Cli {
+    /// Box name (e.g. Lame, Legacy)
+    #[arg(value_name = "BOX", required_unless_present = "init_config")]
+    box_name: Option<String>,
+
+    /// Target IP address
+    #[arg(value_name = "IP", required_unless_present = "init_config")]
+    ip: Option<String>,
+
+    // ── Common — shown in the quick `-h` view ──────────────
+    /// Quick scan: TCP + web headers only
+    ///
+    /// Skips the UDP sweep and deep per-service enumeration — a fast first look.
+    #[arg(short, long)]
+    fast: bool,
+
+    /// Skip services (comma-separated: smb,ldap,web)
+    #[arg(short, long, value_delimiter = ',', value_name = "SVC")]
+    skip: Vec<String>,
+
+    /// Output directory (default: ~/htb/<box-name>/)
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<String>,
+
+    /// Also write a JSON report next to the text one
+    #[arg(long)]
+    json: bool,
+
+    // ── Advanced — hidden from `-h`, full list in `--help` ─
+    /// Reuse existing nmap output instead of re-scanning
+    #[arg(long, hide_short_help = true)]
+    resume: bool,
+
+    /// Show full tool output instead of summaries
+    #[arg(short, long, hide_short_help = true)]
+    verbose: bool,
+
+    /// Re-scan ports every N minutes and alert on changes
+    #[arg(long, value_name = "MINUTES", hide_short_help = true)]
+    watch: Option<u64>,
+
+    /// Global timeout per command in seconds
+    #[arg(short, long, value_name = "SECS", hide_short_help = true)]
+    timeout: Option<u64>,
+
+    /// Feroxbuster thread count
+    #[arg(long, value_name = "N", hide_short_help = true)]
+    ferox_threads: Option<u16>,
+
+    /// Path to config.toml
+    ///
+    /// Default: ./config.toml or ~/.config/pwnbox/config.toml
+    #[arg(short, long, value_name = "PATH", hide_short_help = true)]
+    config: Option<String>,
+
+    /// Generate a default config.toml and exit
+    #[arg(long, hide_short_help = true)]
+    init_config: bool,
+}
+
+/// Grab all open port/proto pairs from nmap output.
+fn parse_open_ports(output: &str) -> HashSet<(u16, String)> {
+    let mut ports = HashSet::new();
+    for cap in RE_OPEN_PORT.captures_iter(output) {
+        if let Ok(p) = cap[1].parse::<u16>() {
+            ports.insert((p, cap[2].to_string()));
+        }
+    }
+    ports
+}
+
+/// Quick check: is this port/proto combo in our set?
+fn has_port(ports: &HashSet<(u16, String)>, port: u16, proto: &str) -> bool {
+    // Iterate rather than `contains(&(port, proto.to_string()))`: the set is
+    // small (open ports on one host) and this avoids allocating a String on
+    // every call — a tuple key can't be borrowed as `(u16, &str)`.
+    ports.iter().any(|(p, pr)| *p == port && pr == proto)
+}
+
+/// Pretty-print open port lines from nmap output.
+fn print_port_lines(output: &str, line_re: &Regex) {
+    let lines: Vec<&str> = output.lines().filter(|l| line_re.is_match(l)).collect();
+    if lines.is_empty() {
+        println!("  {}", "(no open ports)".dimmed());
+    } else {
+        for line in &lines {
+            if let Some(caps) = RE_PORT_DETAIL.captures(line) {
+                println!(
+                    "  {}/{} {} {}",
+                    caps[1].green(),
+                    caps[2].dimmed(),
+                    caps[3].yellow(),
+                    caps[4].dimmed()
+                );
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+}
+
+fn phase_header(step: &str, description: &str) {
+    println!("\n{} {}", step.green(), description.yellow());
+}
+
+fn phase_done(phase_start: Instant) {
+    let elapsed = phase_start.elapsed();
+    println!(
+        "  {} {}",
+        "✓ done".green(),
+        format!("({:.1}s)", elapsed.as_secs_f64()).dimmed()
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Banner helpers — a fully-enclosed, rounded box ("rundes Kästchen").
+//
+// All width math runs on the ANSI-stripped *visible* length with saturating
+// arithmetic, and every variable value is truncated to the inner width before
+// it is colored. So the right border can never drift out of alignment, and an
+// over-long title or path can never underflow/panic. Width is measured with
+// unicode-width (display columns), so wide glyphs like ⚡ count as the 2 cells
+// the terminal uses and the box still lines up.
+// ────────────────────────────────────────────────────────────────────────
+
+const BANNER_INNER: usize = 56; // visible chars in the padded content area
+const LABEL_W: usize = 9; // label column width (longest label + a gap)
+
+// Strip ANSI CSI color sequences so we can measure on-screen width — the byte
+// length of a ColoredString includes the escape codes, which breaks padding.
+static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+
+fn visible_width(s: &str) -> usize {
+    // display width (not char count) so wide glyphs like ⚡ are measured as the
+    // 2 cells the terminal actually uses — keeps the right border aligned.
+    ANSI_RE.replace_all(s, "").width()
+}
+
+/// Truncate a plain string to at most `max` visible chars, using a leading
+/// '…' when it must cut — keeping the tail (for paths, that's the filename).
+fn truncate_tail(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        let tail: String = s.chars().skip(n - (max - 1)).collect();
+        format!("…{tail}")
+    }
+}
+
+/// Border/frame accent color — change this one spot to re-theme the whole box.
+fn frame(s: &str) -> String {
+    s.bright_magenta().to_string()
+}
+
+/// Top border with the title embedded after the corner: `╭─ <title> ─…─╮`.
+/// `title` is already colored.
+fn banner_top(title: &str) -> String {
+    // total visible width matches a content row: │ + ' ' + INNER + ' ' + │
+    let total = BANNER_INNER + 4;
+    // glyphs before the dash run: ╭ ─ ' ' title ' ' (= title + 4) plus ╮ (= 1)
+    let dashes = total.saturating_sub(visible_width(title) + 5);
+    format!(
+        "{}{} {} {}{}",
+        frame("╭"),
+        frame("─"),
+        title,
+        frame(&"─".repeat(dashes)),
+        frame("╮")
+    )
+}
+
+/// Bottom border: a plain rounded rule of the same total width.
+fn banner_bottom() -> String {
+    format!(
+        "{}{}{}",
+        frame("╰"),
+        frame(&"─".repeat(BANNER_INNER + 2)),
+        frame("╯")
+    )
+}
+
+/// One content row: `│ <content padded to BANNER_INNER> │`. `content` may be
+/// colored; the trailing pad is computed from its visible width.
+fn banner_row(content: &str) -> String {
+    let pad = BANNER_INNER.saturating_sub(visible_width(content));
+    format!(
+        "{} {}{} {}",
+        frame("│"),
+        content,
+        " ".repeat(pad),
+        frame("│")
+    )
+}
+
+/// A `label   value` row. `value` is already colored; callers truncate any
+/// unbounded value (e.g. a path) before coloring it.
+fn banner_kv(label: &str, value: &str) -> String {
+    let lab = format!("{:<width$}", label, width = LABEL_W);
+    banner_row(&format!("  {}{}", lab.dimmed(), value))
+}
+
+/// Visible-char budget available to a value after the indent + label column.
+fn kv_budget() -> usize {
+    BANNER_INNER.saturating_sub(2 + LABEL_W)
+}
+
+/// Opening banner: target, start time, active modes, and skipped services.
+fn print_start_banner(name: &str, ip: &str, fast: bool, resume: bool, skip: &[String], json: bool) {
+    let title = format!(
+        "{} {} {}",
+        "pwnbox".bright_green().bold(),
+        "·".dimmed(),
+        "HackTheBox".bright_magenta().bold()
+    );
+    println!("{}", banner_top(&title));
+    println!("{}", banner_row(""));
+
+    let target = format!(
+        "{} {} {}",
+        name.bright_yellow().bold(),
+        "→".dimmed(),
+        ip.bright_red().bold()
+    );
+    println!("{}", banner_kv("target", &target));
+
+    let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    println!("{}", banner_kv("started", &started.cyan().to_string()));
+
+    let mut badges: Vec<String> = Vec::new();
+    if fast {
+        badges.push(format!(
+            "{} {}",
+            "⚡".yellow(),
+            "fast".bright_yellow().bold()
+        ));
+    }
+    if resume {
+        badges.push(format!("{} {}", "↻".cyan(), "resume".bright_cyan().bold()));
+    }
+    if json {
+        badges.push("json+text".green().bold().to_string());
+    }
+    if !badges.is_empty() {
+        let sep = format!(" {} ", "·".dimmed());
+        println!("{}", banner_kv("mode", &badges.join(&sep)));
+    }
+
+    if !skip.is_empty() {
+        let skip_str = truncate_tail(&skip.join(", "), kv_budget());
+        println!("{}", banner_kv("skip", &skip_str.yellow().to_string()));
+    }
+
+    println!("{}", banner_row(""));
+    println!("{}", banner_bottom());
+}
+
+/// Closing banner: target, wall-clock duration, report (+ optional JSON) path.
+fn print_finish_banner(
+    name: &str,
+    ip: &str,
+    mins: u64,
+    secs: u64,
+    report_path: &str,
+    json_path: Option<&str>,
+    mode_tag: &str,
+) {
+    let title = format!(
+        "{} {} {}",
+        "pwnbox".bright_green().bold(),
+        "·".dimmed(),
+        format!("✓ {mode_tag} complete").bright_green().bold()
+    );
+    println!();
+    println!("{}", banner_top(&title));
+    println!("{}", banner_row(""));
+
+    let target = format!(
+        "{} {} {}",
+        name.bright_yellow().bold(),
+        "→".dimmed(),
+        ip.bright_red().bold()
+    );
+    println!("{}", banner_kv("target", &target));
+
+    let duration = format!("{mins}m {secs:02}s");
+    println!(
+        "{}",
+        banner_kv("duration", &duration.bright_white().bold().to_string())
+    );
+
+    let report = truncate_tail(report_path, kv_budget());
+    println!("{}", banner_kv("report", &report.yellow().to_string()));
+    if let Some(jp) = json_path {
+        let jp = truncate_tail(jp, kv_budget());
+        println!("{}", banner_kv("json", &jp.yellow().to_string()));
+    }
+
+    println!("{}", banner_row(""));
+    println!("{}", banner_bottom());
+}
+
+/// Slim section header printed above the textual scan report.
+fn print_report_banner(name: &str, ip: &str) {
+    let title = format!(
+        "{} {} {} {} {}",
+        "scan report".bright_green().bold(),
+        "·".dimmed(),
+        name.bright_yellow().bold(),
+        "→".dimmed(),
+        ip.bright_red().bold()
+    );
+    println!("{}", banner_top(&title));
+    println!("{}", banner_bottom());
+}
+
+/// Extract structured port info from nmap output for JSON report.
+fn parse_port_entries(output: &str) -> Vec<(u16, String, String, String)> {
+    let mut entries = Vec::new();
+    for cap in RE_PORT_DETAIL.captures_iter(output) {
+        if let Ok(port) = cap[1].parse::<u16>() {
+            entries.push((
+                port,
+                cap[2].to_string(),
+                cap[3].to_string(),
+                cap[4].to_string(),
+            ));
+        }
+    }
+    entries
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // --init-config: dump a default config and bail
+    if cli.init_config {
+        let path = std::path::PathBuf::from(cli.config.as_deref().unwrap_or("config.toml"));
+        return FileConfig::init(&path);
+    }
+
+    // clap enforces these via `required_unless_present = "init_config"`, and the
+    // --init-config path already returned above, so they are guaranteed present.
+    let box_name = cli.box_name.as_deref().expect("BOX is required by clap");
+    let ip = cli.ip.as_deref().expect("IP is required by clap");
+
+    // reject anything that isn't a real IP/hostname before it reaches any command
+    if !hosts::is_valid_target(ip) {
+        eprintln!(
+            "{} Invalid target {:?} — expected an IP address or hostname",
+            "[!]".red().bold(),
+            ip
+        );
+        std::process::exit(1);
+    }
+
+    // box_name becomes part of the output path (~/htb/<box>/) — keep it from
+    // escaping that directory via path separators or traversal
+    if box_name.is_empty()
+        || box_name.contains('/')
+        || box_name.contains('\\')
+        || box_name.contains("..")
+    {
+        eprintln!(
+            "{} Invalid box name {:?} — must not contain '/', '\\' or '..'",
+            "[!]".red().bold(),
+            box_name
+        );
+        std::process::exit(1);
+    }
+
+    // load config (or fall back to defaults)
+    let file_cfg = FileConfig::load(cli.config.as_deref())?;
+
+    let cfg = BoxConfig::new(box_name, ip, cli.output.as_deref());
+    let scan_cfg = ScanConfig::new(
+        cli.verbose.then_some(true),
+        &cli.skip,
+        cli.timeout,
+        cli.fast.then_some(true),
+        cli.ferox_threads,
+        &file_cfg,
+    );
+    let report = Report::new();
+    let start = Instant::now();
+
+    // apply the resolved timeout/verbosity globally so every command honours them
+    runner::set_default_timeout(scan_cfg.timeout);
+    runner::set_verbose(scan_cfg.verbose);
+
+    // make sure output dir exists
+    tokio::fs::create_dir_all(&cfg.output_dir).await?;
+
+    // show the start banner
+    print_start_banner(
+        &cfg.name,
+        &cfg.ip,
+        scan_cfg.fast,
+        cli.resume,
+        &cli.skip,
+        cli.json,
+    );
+
+    // Check only tools needed by the resolved scan plan, including overrides.
+    tools::check_all(&scan_cfg).await?;
+
+    // start building the report
+    report
+        .add(&format!("pwnbox  {}  →  {}", cfg.name, cfg.ip))
+        .await;
+    report
+        .add(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
+        .await;
+    if scan_cfg.fast {
+        report.add("Mode: fast").await;
+    }
+
+    // seed JSON report with basic info
+    {
+        let mut json = report.json_mut().await;
+        json.box_name = cfg.name.clone();
+        json.ip = cfg.ip.clone();
+        json.timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        json.mode = if scan_cfg.fast {
+            "fast".to_string()
+        } else {
+            "full".to_string()
+        };
+    }
+
+    // warm up sudo so we don't get prompted mid-scan
+    if !runner::has_sudo().await {
+        println!("{} sudo required (for /etc/hosts & UDP scan)", "[*]".cyan());
+        let _ = runner::run_cmd("sudo", &["-v"]).await;
+    }
+
+    // --- Phase 0: ping check + OS guess from TTL ---
+    let t = Instant::now();
+    phase_header("[0/6]", "Connectivity check...");
+    let os_guess = scans::connectivity::check(&cfg.ip, &report).await?;
+    {
+        let mut json = report.json_mut().await;
+        json.os_guess = os_guess.clone();
+    }
+    phase_done(t);
+
+    // --- Phase 1: /etc/hosts + DNS recon ---
+    let t = Instant::now();
+    phase_header("[1/6]", "/etc/hosts + DNS recon...");
+    let _ = hosts::add_hosts(&cfg.ip, std::slice::from_ref(&cfg.hostname)).await;
+    report.add_hostname(&cfg.hostname).await;
+
+    // dns::recon checks for `dig` itself, so we don't gate on the dns module's
+    // optional tools (dnsx/subfinder) — and a recon error must not abort the scan
+    if scan_cfg.should_skip("dns") {
+        // explicitly skipped by user
+    } else {
+        match scans::dns::recon(&cfg.ip, &cfg.hostname, &scan_cfg, &report).await {
+            Ok(dns_hosts) => {
+                for h in &dns_hosts {
+                    report.add_hostname(h).await;
+                }
+            }
+            Err(e) => {
+                println!("{} DNS recon failed: {e}", "[!]".yellow());
+                report.add_error("DNS", &e.to_string()).await;
+            }
+        }
+    }
+    phase_done(t);
+
+    // --- Phase 2: TCP port discovery ---
+    let t = Instant::now();
+    phase_header("[2/6]", "TCP port discovery...");
+    let nmap_output =
+        scans::tcp::scan(&cfg.ip, &cfg.output_dir, &report, cli.resume, &scan_cfg).await?;
+
+    // pull hostnames from nmap output (SSL certs, redirects, etc.) — best-effort
+    let nmap_hosts = match scans::tcp::extract_hostnames(&nmap_output, &cfg.ip).await {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            println!("{} Hostname extraction failed: {e}", "[!]".yellow());
+            report.add_error("HOSTNAMES", &e.to_string()).await;
+            Vec::new()
+        }
+    };
+    for h in &nmap_hosts {
+        report.add_hostname(h).await;
+    }
+    phase_done(t);
+
+    // parse ports once so we can decide which service scans to run
+    let tcp_ports = parse_open_ports(&nmap_output);
+
+    // grab hostnames from SSL certs on HTTPS ports — a port counts as SSL if it's
+    // a well-known TLS port or *its own* nmap line mentions ssl (checked per-port,
+    // not globally across the whole output)
+    let ssl_ports: Vec<u16> = tcp_ports
+        .iter()
+        .filter(|(_, proto)| proto == "tcp")
+        .map(|(p, _)| *p)
+        .filter(|p| {
+            [443, 8443].contains(p)
+                || nmap_output
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{p}/tcp")) && l.contains("ssl"))
+        })
+        .collect();
+    if !ssl_ports.is_empty() {
+        let known: Vec<String> = {
+            let json = report.json_mut().await;
+            json.hostnames.clone()
+        };
+        let ssl_hosts = match scans::tcp::ssl_hostnames(&cfg.ip, &ssl_ports, &known, &report).await
+        {
+            Ok(hosts) => hosts,
+            Err(e) => {
+                println!("{} TLS hostname discovery failed: {e}", "[!]".yellow());
+                report.add_error("TLS", &e.to_string()).await;
+                Vec::new()
+            }
+        };
+        for h in &ssl_hosts {
+            report.add_hostname(h).await;
+        }
+        if !ssl_hosts.is_empty() {
+            let _ = hosts::add_hosts(&cfg.ip, &ssl_hosts).await;
+        }
+    }
+
+    // fill JSON report with port data
+    for (port, proto, service, version) in parse_port_entries(&nmap_output) {
+        report
+            .add_port(port, &proto, "open", &service, &version)
+            .await;
+    }
+
+    let resume = cli.resume;
+
+    // kick off vuln scan in the background (skipped in fast mode)
+    let vuln_handle: Option<JoinHandle<Result<Report>>> =
+        if !scan_cfg.fast && !scan_cfg.should_skip("vuln") && !tcp_ports.is_empty() {
+            phase_header("[2b/6]", "Nmap vuln scripts (background)...");
+            let port_list: String = tcp_ports
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let vuln_ip = cfg.ip.clone();
+            let vuln_dir = cfg.output_dir.clone();
+            let vuln_cfg = scan_cfg.clone();
+            Some(tokio::spawn(async move {
+                // write into an isolated report, merged back after join so this
+                // section can't interleave with other concurrent writers
+                let tr = Report::new();
+                scans::tcp::vuln_scan(&vuln_ip, &port_list, &vuln_dir, &tr, resume, &vuln_cfg)
+                    .await?;
+                Ok(tr)
+            }))
+        } else {
+            None
+        };
+
+    // fast mode: just do basic web headers, skip the rest
+    if scan_cfg.fast {
+        // just curl headers, no dir brute or vhost scanning
+        if !scan_cfg.should_skip("web") {
+            let t = Instant::now();
+            phase_header("[4/6]", "Web (fast: headers only)...");
+            scans::web::enumerate(
+                &cfg.ip,
+                &cfg.hostname,
+                &nmap_output,
+                &cfg.output_dir,
+                &report,
+                &scan_cfg,
+            )
+            .await?;
+            // web::enumerate respects scan_cfg.fast internally
+            phase_done(t);
+        }
+
+        // no UDP, no deep service enum in fast mode
+        println!(
+            "\n{} Fast mode: skipping UDP scan + deep service enumeration",
+            "[*]".yellow()
+        );
+
+        // still dump a summary + write the report
+        print_summary(&cfg, &nmap_output, "", &os_guess, &report).await;
+        report.write_to_file(&cfg.report_path).await?;
+        let json_path = if cli.json {
+            let p = cfg.report_path.with_extension("json");
+            report.write_json(&p).await?;
+            Some(p)
+        } else {
+            None
+        };
+
+        let elapsed = start.elapsed();
+        let mins = elapsed.as_secs() / 60;
+        let secs = elapsed.as_secs() % 60;
+        let json_disp = json_path.as_ref().map(|p| p.display().to_string());
+        print_finish_banner(
+            &cfg.name,
+            &cfg.ip,
+            mins,
+            secs,
+            &cfg.report_path.display().to_string(),
+            json_disp.as_deref(),
+            "fast scan",
+        );
+
+        return Ok(());
+    }
+
+    // --- Phase 3: UDP scan (runs in background) ---
+    let udp_handle: Option<JoinHandle<Result<(String, Report)>>> = if !scan_cfg.should_skip("udp") {
+        phase_header("[3/6]", "UDP scan (background)...");
+        let udp_ip = cfg.ip.clone();
+        let udp_dir = cfg.output_dir.clone();
+        let udp_cfg = scan_cfg.clone();
+        Some(tokio::spawn(async move {
+            // isolated report, merged back after join
+            let tr = Report::new();
+            let out = scans::udp::scan(&udp_ip, &udp_dir, &tr, resume, &udp_cfg).await?;
+            Ok((out, tr))
+        }))
+    } else {
+        println!("\n{} UDP scan skipped", "[*]".dimmed());
+        None
+    };
+
+    // --- Phase 4: Web enumeration ---
+    let web_bg_tasks = if !scan_cfg.should_skip("web") {
+        let t = Instant::now();
+        phase_header("[4/6]", "Web enumeration...");
+        let tasks = scans::web::enumerate(
+            &cfg.ip,
+            &cfg.hostname,
+            &nmap_output,
+            &cfg.output_dir,
+            &report,
+            &scan_cfg,
+        )
+        .await?;
+        phase_done(t);
+        tasks
+    } else {
+        println!("\n{} Web enumeration skipped", "[*]".dimmed());
+        Vec::new()
+    };
+
+    // --- Phase 5: service-specific scans (all run in parallel) ---
+    let t = Instant::now();
+    phase_header("[5/6]", "Service enumeration (parallel)...");
+
+    // spawn one task per service, collect results later
+    // each task writes into its own Report (returned via the JoinHandle) so its
+    // section can't interleave with another task's; merged back on collection
+    let mut svc_handles: Vec<(&str, JoinHandle<Result<Report>>)> = Vec::new();
+
+    // SSH
+    if has_port(&tcp_ports, 22, "tcp") && !scan_cfg.should_skip("ssh") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        svc_handles.push((
+            "SSH",
+            tokio::spawn(async move {
+                scans::ssh::check(&ip, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // FTP
+    if has_port(&tcp_ports, 21, "tcp") && !scan_cfg.should_skip("ftp") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "FTP",
+            tokio::spawn(async move {
+                scans::ftp::check_anonymous(&ip, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // SMB
+    if has_port(&tcp_ports, 445, "tcp") && !scan_cfg.should_skip("smb") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "SMB",
+            tokio::spawn(async move {
+                scans::smb::enumerate(&ip, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // RPC
+    if has_port(&tcp_ports, 135, "tcp") && !scan_cfg.should_skip("rpc") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "RPC",
+            tokio::spawn(async move {
+                scans::rpc::enumerate(&ip, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // NFS
+    if (has_port(&tcp_ports, 2049, "tcp") || has_port(&tcp_ports, 111, "tcp"))
+        && !scan_cfg.should_skip("nfs")
+    {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "NFS",
+            tokio::spawn(async move {
+                scans::nfs::enumerate(&ip, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // MySQL
+    if has_port(&tcp_ports, 3306, "tcp") && !scan_cfg.should_skip("mysql") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        svc_handles.push((
+            "MySQL",
+            tokio::spawn(async move {
+                scans::mysql::check(&ip, 3306, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // PostgreSQL
+    if has_port(&tcp_ports, 5432, "tcp") && !scan_cfg.should_skip("postgres") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        svc_handles.push((
+            "PostgreSQL",
+            tokio::spawn(async move {
+                scans::postgres::check(&ip, 5432, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // Redis
+    if has_port(&tcp_ports, 6379, "tcp") && !scan_cfg.should_skip("redis") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        svc_handles.push((
+            "Redis",
+            tokio::spawn(async move {
+                scans::redis::check(&ip, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // WinRM
+    for winrm_port in [5985u16, 5986] {
+        if has_port(&tcp_ports, winrm_port, "tcp") && !scan_cfg.should_skip("winrm") {
+            let r = Report::new();
+            let ip = cfg.ip.clone();
+            let sc = scan_cfg.clone();
+            svc_handles.push((
+                "WinRM",
+                tokio::spawn(async move {
+                    scans::winrm::check(&ip, winrm_port, &sc, &r).await?;
+                    Ok(r)
+                }),
+            ));
+            break; // only need to check one WinRM port
+        }
+    }
+
+    // MSSQL
+    if has_port(&tcp_ports, 1433, "tcp") && !scan_cfg.should_skip("mssql") {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "MSSQL",
+            tokio::spawn(async move {
+                scans::mssql::check(&ip, 1433, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
+    }
+
+    // SMTP
+    for smtp_port in [25u16, 465, 587] {
+        if has_port(&tcp_ports, smtp_port, "tcp") && !scan_cfg.should_skip("smtp") {
+            let r = Report::new();
+            let ip = cfg.ip.clone();
+            let sc = scan_cfg.clone();
+            svc_handles.push((
+                "SMTP",
+                tokio::spawn(async move {
+                    scans::smtp::check(&ip, smtp_port, &sc, &r).await?;
+                    Ok(r)
+                }),
+            ));
+            break; // one SMTP scan is enough
+        }
+    }
+
+    // LDAP runs first (not in parallel) because Kerberos needs the domain
+    let mut ldap_domain: Option<String> = None;
+    if (has_port(&tcp_ports, 389, "tcp") || has_port(&tcp_ports, 636, "tcp"))
+        && !scan_cfg.should_skip("ldap")
+    {
+        let ldap_port = if has_port(&tcp_ports, 389, "tcp") {
+            389
+        } else {
+            636
+        };
+        println!("{} LDAP enumeration on port {ldap_port}...", "[*]".cyan());
+        ldap_domain = match scans::ldap::enumerate(&cfg.ip, ldap_port, &scan_cfg, &report).await {
+            Ok(domain) => domain,
+            Err(e) => {
+                println!("{} LDAP enumeration failed: {e}", "[!]".yellow());
+                report.add_error("LDAP", &e.to_string()).await;
+                None
+            }
+        };
+    }
+
+    // collect results from parallel service scans, merging each task's report
+    for (name, handle) in svc_handles {
+        match handle.await {
+            Ok(Ok(tr)) => {
+                report.merge_from(&tr).await;
+                println!("{} {name} done", "[+]".green());
+            }
+            Ok(Err(e)) => {
+                println!("{} {name} failed: {e}", "[!]".yellow());
+                report.add_error(name, &e.to_string()).await;
+            }
+            Err(e) => {
+                println!("{} {name} panicked: {e}", "[!]".yellow());
+                report.add_error(name, &format!("task panicked: {e}")).await;
+            }
+        }
+    }
+    phase_done(t);
+
+    // wait for the UDP scan to finish
+    let udp_output = if let Some(handle) = udp_handle {
+        println!("\n{} Waiting for UDP scan...", "[*]".yellow());
+        match handle.await {
+            Ok(Ok((output, tr))) => {
+                report.merge_from(&tr).await;
+                println!("{} UDP scan complete", "[+]".green());
+                for (port, proto, service, version) in parse_port_entries(&output) {
+                    report
+                        .add_port(port, &proto, "open", &service, &version)
+                        .await;
+                }
+                output
+            }
+            Ok(Err(e)) => {
+                println!("{} UDP scan failed: {e}", "[!]".yellow());
+                report.add_error("UDP", &e.to_string()).await;
+                String::new()
+            }
+            Err(e) => {
+                println!("{} UDP scan panicked: {e}", "[!]".yellow());
+                report
+                    .add_error("UDP", &format!("task panicked: {e}"))
+                    .await;
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // SNMP/Kerberos depend on UDP results, so they run after
+    let udp_ports = parse_open_ports(&udp_output);
+
+    if has_port(&udp_ports, 161, "udp") && !scan_cfg.should_skip("snmp") {
+        println!("\n{} SNMP detected — enumerating...", "[*]".cyan());
+        if let Err(e) = scans::snmp::check(&cfg.ip, &scan_cfg, &report).await {
+            println!("{} SNMP enumeration failed: {e}", "[!]".yellow());
+            report.add_error("SNMP", &e.to_string()).await;
+        }
+    }
+
+    // kerberos uses the domain we found from LDAP (if any)
+    if has_port(&tcp_ports, 88, "tcp") && !scan_cfg.should_skip("kerberos") {
+        println!("\n{} Kerberos enumeration...", "[*]".cyan());
+        if let Err(e) = scans::kerberos::enumerate(
+            &cfg.ip,
+            &cfg.hostname,
+            ldap_domain.as_deref(),
+            &scan_cfg,
+            &report,
+        )
+        .await
+        {
+            println!("{} Kerberos enumeration failed: {e}", "[!]".yellow());
+            report.add_error("KERBEROS", &e.to_string()).await;
+        }
+    }
+
+    // wait for feroxbuster / vhost scans to wrap up
+    if !web_bg_tasks.is_empty() {
+        println!(
+            "\n{} Waiting for {} web background task(s)...",
+            "[*]".yellow(),
+            web_bg_tasks.len()
+        );
+        let mut web_failures = 0usize;
+        for task in web_bg_tasks {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    web_failures += 1;
+                    println!("{} Web background task failed: {e}", "[!]".yellow());
+                    report.add_error("WEB", &e.to_string()).await;
+                }
+                Err(e) => {
+                    web_failures += 1;
+                    println!("{} Web background task panicked: {e}", "[!]".yellow());
+                    report
+                        .add_error("WEB", &format!("background task panicked: {e}"))
+                        .await;
+                }
+            }
+        }
+        if web_failures == 0 {
+            println!("{} Web background tasks complete", "[+]".green());
+        } else {
+            println!(
+                "{} Web background tasks complete with {web_failures} failure(s)",
+                "[!]".yellow()
+            );
+        }
+
+        process_ferox_results(&cfg, &report).await;
+        process_vhost_results(&cfg, &report).await;
+    }
+
+    // wait for vuln scan
+    if let Some(handle) = vuln_handle {
+        println!("\n{} Waiting for vuln scan...", "[*]".yellow());
+        match handle.await {
+            Ok(Ok(tr)) => {
+                report.merge_from(&tr).await;
+                println!("{} Vuln scan complete", "[+]".green());
+            }
+            Ok(Err(e)) => {
+                println!("{} Vuln scan failed: {e}", "[!]".yellow());
+                report.add_error("VULN", &e.to_string()).await;
+            }
+            Err(e) => {
+                println!("{} Vuln scan panicked: {e}", "[!]".yellow());
+                report
+                    .add_error("VULN", &format!("task panicked: {e}"))
+                    .await;
+            }
+        }
+    }
+
+    // all done, print the summary and write reports
+    print_summary(&cfg, &nmap_output, &udp_output, &os_guess, &report).await;
+    report.write_to_file(&cfg.report_path).await?;
+
+    let json_path = if cli.json {
+        let p = cfg.report_path.with_extension("json");
+        report.write_json(&p).await?;
+        Some(p)
+    } else {
+        None
+    };
+
+    // print total runtime
+    let elapsed = start.elapsed();
+    let mins = elapsed.as_secs() / 60;
+    let secs = elapsed.as_secs() % 60;
+    let json_disp = json_path.as_ref().map(|p| p.display().to_string());
+    print_finish_banner(
+        &cfg.name,
+        &cfg.ip,
+        mins,
+        secs,
+        &cfg.report_path.display().to_string(),
+        json_disp.as_deref(),
+        "scan",
+    );
+
+    // watch mode: keep re-scanning and alert on port changes
+    if let Some(interval_mins) = cli.watch {
+        let interval = std::cmp::max(interval_mins, 1);
+        println!(
+            "\n{} Watch mode: re-scanning every {} minute(s). Press Ctrl+C to stop.",
+            "[*]".cyan().bold(),
+            interval
+        );
+        let watch_nmap = scan_cfg.tool("nmap");
+        let watch_timeout = runner::default_timeout().max(300);
+        // The initial scan may have used a narrower scope (rustscan top ports) than
+        // the full `-p-` rescan below, so the first watch scan establishes the
+        // baseline instead of diffing against it — otherwise every port only the
+        // full scan sees would be flagged as "NEW".
+        let mut known_ports: Option<HashSet<(u16, String)>> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval.saturating_mul(60))).await;
+            println!(
+                "\n{} Re-scanning at {}...",
+                "[watch]".cyan(),
+                chrono::Local::now().format("%H:%M:%S")
+            );
+            let rescan = match runner::run_cmd_timeout(
+                &watch_nmap,
+                &["-Pn", "-p-", "--min-rate", "5000", "-T4", &cfg.ip],
+                watch_timeout,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    println!(
+                        "{} Re-scan failed; keeping previous baseline: {e}",
+                        "[watch]".yellow()
+                    );
+                    report.add_error("WATCH", &e.to_string()).await;
+                    continue;
+                }
+            };
+
+            let new_ports = parse_open_ports(&rescan);
+
+            match known_ports.as_ref() {
+                None => {
+                    println!(
+                        "{} Baseline established: {} open port(s)",
+                        "[watch]".cyan(),
+                        new_ports.len()
+                    );
+                }
+                Some(prev) => {
+                    let appeared: Vec<_> = new_ports.difference(prev).collect();
+                    let disappeared: Vec<_> = prev.difference(&new_ports).collect();
+
+                    if !appeared.is_empty() {
+                        println!(
+                            "{} NEW PORTS: {}",
+                            "[!!]".red().bold(),
+                            appeared
+                                .iter()
+                                .map(|(p, proto)| format!("{p}/{proto}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                                .red()
+                        );
+                    }
+                    if !disappeared.is_empty() {
+                        println!(
+                            "{} CLOSED PORTS: {}",
+                            "[--]".yellow(),
+                            disappeared
+                                .iter()
+                                .map(|(p, proto)| format!("{p}/{proto}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                                .yellow()
+                        );
+                    }
+                    if appeared.is_empty() && disappeared.is_empty() {
+                        println!("{} No port changes detected", "[ok]".green());
+                    }
+                }
+            }
+            known_ports = Some(new_ports);
+        }
+    }
+
+    Ok(())
+}
+
+// Feroxbuster result lines start with an HTTP status code, e.g. "200      GET".
+static RE_FEROX_RESULT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{3}\s+\w+").unwrap());
+
+/// Clean up feroxbuster output: strip config noise, keep actual findings.
+async fn process_ferox_results(cfg: &BoxConfig, report: &Report) {
+    let mut found_any = false;
+
+    let mut entries = match tokio::fs::read_dir(&cfg.output_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            report.add_error("DIR BRUTE", &e.to_string()).await;
+            return;
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                report
+                    .add_error(
+                        "DIR BRUTE",
+                        &format!("result directory iteration failed: {e}"),
+                    )
+                    .await;
+                break;
+            }
+        };
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("ferox-") || !name.ends_with(".txt") {
+            continue;
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(e) => {
+                report
+                    .add_error("DIR BRUTE", &format!("{}: {e}", path.display()))
+                    .await;
+                continue;
+            }
+        };
+        let results: Vec<&str> = content
+            .lines()
+            .filter(|l| RE_FEROX_RESULT.is_match(l))
+            .collect();
+        if results.is_empty() {
+            // Keep the raw feroxbuster output even when nothing parsed out —
+            // deleting it would throw away scan evidence.
+            continue;
+        }
+        if !found_any {
+            report.section("DIR BRUTE").await;
+            found_any = true;
+        }
+        println!(
+            "{} {} ({} results)",
+            "[+]".green(),
+            path.display().to_string().yellow(),
+            results.len()
+        );
+        report.add(&format!("  -> {}", path.display())).await;
+        for line in &results {
+            report.add(line).await;
+            report
+                .add_service_finding("web", &format!("dir: {line}"))
+                .await;
+        }
+    }
+}
+
+// gobuster vhost output uses lines like "Found: shop.example.htb (Status: 200)".
+static RE_GOBUSTER_FOUND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Found:\s*(\S+)").unwrap());
+
+fn normalize_vhost_candidate(candidate: &str, base_domain: &str) -> Option<String> {
+    let mut host = candidate.trim().trim_end_matches('.').to_lowercase();
+    for prefix in ["http://", "https://"] {
+        if let Some(stripped) = host.strip_prefix(prefix) {
+            host = stripped.to_string();
+            break;
+        }
+    }
+    host = host.split('/').next().unwrap_or("").to_string();
+    if let Some((name, port)) = host.rsplit_once(':')
+        && port.parse::<u16>().is_ok()
+    {
+        host = name.to_string();
+    }
+    if !host.contains('.') {
+        host = format!("{host}.{base_domain}");
+    }
+    hosts::is_valid_hostname(&host).then_some(host)
+}
+
+/// Parse vhost scan results (ffuf CSV or gobuster format) and add to /etc/hosts.
+async fn process_vhost_results(cfg: &BoxConfig, report: &Report) {
+    let mut found_any = false;
+
+    let mut entries = match tokio::fs::read_dir(&cfg.output_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            report.add_error("VHOSTS", &e.to_string()).await;
+            return;
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                report
+                    .add_error("VHOSTS", &format!("result directory iteration failed: {e}"))
+                    .await;
+                break;
+            }
+        };
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("vhosts-") || !name.ends_with(".txt") {
+            continue;
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(e) => {
+                report
+                    .add_error("VHOSTS", &format!("{}: {e}", path.display()))
+                    .await;
+                continue;
+            }
+        };
+        let first_line = content.lines().next().unwrap_or("");
+
+        let candidates: Vec<String> = if first_line.contains("FUZZ") {
+            // ffuf CSV: first column is the FUZZ input word
+            content
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split(',').next())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            // gobuster emits an already-qualified hostname
+            content
+                .lines()
+                .filter_map(|l| RE_GOBUSTER_FOUND.captures(l))
+                .map(|c| c[1].to_string())
+                .collect()
+        };
+
+        let mut fqdns = Vec::new();
+        for candidate in &candidates {
+            if let Some(fqdn) = normalize_vhost_candidate(candidate, &cfg.hostname)
+                && !fqdns.contains(&fqdn)
+            {
+                fqdns.push(fqdn);
+            }
+        }
+
+        if fqdns.is_empty() {
+            println!("{} No new vhosts found", "[!]".yellow());
+            // Keep the raw scan output rather than deleting it on an empty parse.
+            continue;
+        }
+
+        if !found_any {
+            report.section("VHOSTS").await;
+            found_any = true;
+        }
+
+        println!("{} Discovered vhosts:", "[+]".green());
+        for fqdn in &fqdns {
+            println!("    {}", fqdn.cyan());
+            report.add_hostname(fqdn).await;
+        }
+        if let Err(e) = hosts::add_hosts(&cfg.ip, &fqdns).await {
+            report.add_error("VHOSTS", &e.to_string()).await;
+        }
+
+        report.add(&format!("  -> {}", path.display())).await;
+        for fqdn in &fqdns {
+            report.add(fqdn).await;
+        }
+    }
+}
+
+/// Print the final scan summary with ports, hosts, and next steps.
+async fn print_summary(
+    cfg: &BoxConfig,
+    nmap_output: &str,
+    udp_output: &str,
+    os_guess: &str,
+    report: &Report,
+) {
+    println!();
+    print_report_banner(&cfg.name, &cfg.ip);
+
+    println!("\n  {}", "[ OS ]".magenta().bold());
+    println!("  {}", os_guess.cyan());
+
+    println!("\n  {}", "[ TCP ]".magenta().bold());
+    print_port_lines(nmap_output, &RE_TCP_LINE);
+
+    if udp_output.lines().any(|l| RE_UDP_LINE.is_match(l)) {
+        println!("\n  {}", "[ UDP ]".magenta().bold());
+        print_port_lines(udp_output, &RE_UDP_LINE);
+    }
+
+    println!("\n  {}", "[ HOSTS ]".magenta().bold());
+    let hosts_content = tokio::fs::read_to_string("/etc/hosts")
+        .await
+        .unwrap_or_default();
+    if let Ok(ip_re) = Regex::new(&format!("^{}\\s+", regex::escape(&cfg.ip)))
+        && let Some(line) = hosts_content.lines().find(|l| ip_re.is_match(l))
+    {
+        println!("  {}", line.cyan());
+        report.section("HOSTS").await;
+        report.add(line).await;
+    }
+
+    println!("\n  {}", "[ FILES ]".magenta().bold());
+    println!(
+        "  {} {}",
+        "Report".dimmed(),
+        cfg.report_path.display().to_string().yellow()
+    );
+    let nmap_tcp = cfg.output_dir.join("nmap-tcp.txt");
+    if nmap_tcp.exists() {
+        println!(
+            "  {} {}",
+            "Nmap TCP".dimmed(),
+            nmap_tcp.display().to_string().yellow()
+        );
+    }
+    let nmap_udp = cfg.output_dir.join("nmap-udp.txt");
+    if nmap_udp.exists() {
+        println!(
+            "  {} {}",
+            "Nmap UDP".dimmed(),
+            nmap_udp.display().to_string().yellow()
+        );
+    }
+    if let Ok(mut entries) = tokio::fs::read_dir(&cfg.output_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("ferox-") && name.ends_with(".txt") {
+                println!(
+                    "  {} {}",
+                    "Ferox".dimmed(),
+                    entry.path().display().to_string().yellow()
+                );
+            } else if name.starts_with("vhosts-") && name.ends_with(".txt") {
+                println!(
+                    "  {} {}",
+                    "Vhosts".dimmed(),
+                    entry.path().display().to_string().yellow()
+                );
+            }
+        }
+    }
+
+    // suggest next steps based on which ports are open
+    let mut next_steps: Vec<String> = Vec::new();
+    let all_ports = extract_open_ports(nmap_output, udp_output);
+    for port in &all_ports {
+        let step = match *port {
+            21 => Some("FTP(21): check anonymous login, upload/download files"),
+            22 => Some("SSH(22): try default/found creds, check version for CVEs"),
+            25 => Some("SMTP(25): smtp-user-enum, check for open relay"),
+            53 => Some("DNS(53): dig axfr, subdomain brute with dnsenum/gobuster dns"),
+            80 => Some("HTTP(80): check source, robots.txt, tech stack, dir brute deeper"),
+            88 => Some("Kerberos(88): kerbrute userenum, AS-REP roasting (GetNPUsers.py)"),
+            110 => Some("POP3(110): try default creds, enumerate emails"),
+            111 => Some("RPC(111): rpcinfo -p, showmount -e"),
+            135 => Some("MSRPC(135): rpcclient -U '' -N, impacket-rpcdump"),
+            139 => Some("NetBIOS(139): nbtscan, enum4linux-ng"),
+            389 | 636 => Some("LDAP(389/636): ldapsearch, windapsearch, enum users/groups"),
+            443 => Some("HTTPS(443): check cert CN/SAN for hostnames, dir brute, source review"),
+            445 => Some("SMB(445): smbmap, crackmapexec --shares, enum4linux-ng"),
+            464 => Some("Kpasswd(464): password change service — try kpasswd attacks"),
+            593 => Some("HTTP-RPC(593): rpcclient, impacket tools"),
+            1433 => Some("MSSQL(1433): impacket-mssqlclient, default sa creds, xp_cmdshell"),
+            1521 => Some("Oracle(1521): odat, tnscmd10g, default creds"),
+            2049 => Some("NFS(2049): showmount -e, mount shares"),
+            3306 => Some("MySQL(3306): mysql -h -u root, default creds, UDF exploit"),
+            3389 => Some("RDP(3389): xfreerdp, check for BlueKeep (CVE-2019-0708)"),
+            5432 => Some("PostgreSQL(5432): psql, check for command exec via COPY/lo_export"),
+            5985 | 5986 => Some("WinRM(5985/5986): evil-winrm, try found creds"),
+            6379 => Some("Redis(6379): redis-cli INFO, check unauth, write webshell/ssh-key"),
+            8080 => Some("HTTP(8080): check for admin panels, APIs, alternative web app"),
+            8443 => Some("HTTPS(8443): check cert, admin panels, API endpoints"),
+            8000 | 8888 | 9090 => Some("Web-Alt: check for admin panels, APIs, dev servers"),
+            27017 => Some("MongoDB(27017): mongosh --host, check no-auth"),
+            _ => None,
+        };
+        if let Some(s) = step {
+            let text = s.to_string();
+            if !next_steps.contains(&text) {
+                next_steps.push(text);
+            }
+        }
+    }
+
+    if !next_steps.is_empty() {
+        println!("\n  {}", "[ NEXT STEPS ]".magenta().bold());
+        report.section("NEXT STEPS").await;
+        for step in &next_steps {
+            println!("  {} {step}", "->".yellow());
+            report.add(&format!("  -> {step}")).await;
+            report.add_next_step(step).await;
+        }
+    }
+
+    let scan_errors = report.errors().await;
+    if !scan_errors.is_empty() {
+        println!("\n  {}", "[ SCAN ERRORS ]".red().bold());
+        report.section("SCAN ERRORS").await;
+        for error in &scan_errors {
+            println!("  {} {error}", "!!".red());
+            report.add(&format!("  !! {error}")).await;
+        }
+    }
+}
+
+/// Merge TCP + UDP port numbers into a sorted, deduplicated list.
+fn extract_open_ports(tcp_output: &str, udp_output: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> = Vec::new();
+    for output in [tcp_output, udp_output] {
+        for cap in RE_OPEN_PORT.captures_iter(output) {
+            if let Ok(p) = cap[1].parse::<u16>()
+                && !ports.contains(&p)
+            {
+                ports.push(p);
+            }
+        }
+    }
+    ports.sort();
+    ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NMAP_TCP_OUTPUT: &str = "\
+Starting Nmap 7.94 ( https://nmap.org )
+Nmap scan report for 10.10.10.1
+PORT     STATE SERVICE      VERSION
+22/tcp   open  ssh          OpenSSH 8.9p1 Ubuntu 3ubuntu0.1
+80/tcp   open  http         Apache httpd 2.4.52
+443/tcp  open  ssl/http     nginx 1.18.0
+3306/tcp open  mysql        MySQL 8.0.32
+8080/tcp open  http-proxy
+Nmap done: 1 IP address (1 host up)";
+
+    const NMAP_UDP_OUTPUT: &str = "\
+PORT    STATE SERVICE
+53/udp  open  domain
+161/udp open  snmp
+631/udp open  ipp";
+
+    // udp commonly reports "open|filtered" — these must not be dropped
+    const NMAP_UDP_FILTERED: &str = "\
+PORT     STATE         SERVICE
+161/udp  open|filtered snmp
+500/udp  open          isakmp";
+
+    #[test]
+    fn test_parse_open_ports_tcp() {
+        let ports = parse_open_ports(NMAP_TCP_OUTPUT);
+        assert!(ports.contains(&(22, "tcp".to_string())));
+        assert!(ports.contains(&(80, "tcp".to_string())));
+        assert!(ports.contains(&(443, "tcp".to_string())));
+        assert!(ports.contains(&(3306, "tcp".to_string())));
+        assert!(ports.contains(&(8080, "tcp".to_string())));
+        assert_eq!(ports.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_open_ports_udp() {
+        let ports = parse_open_ports(NMAP_UDP_OUTPUT);
+        assert!(ports.contains(&(53, "udp".to_string())));
+        assert!(ports.contains(&(161, "udp".to_string())));
+        assert!(ports.contains(&(631, "udp".to_string())));
+        assert_eq!(ports.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_open_ports_empty() {
+        let ports = parse_open_ports("no ports here");
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_open_ports_udp_open_filtered() {
+        let ports = parse_open_ports(NMAP_UDP_FILTERED);
+        assert!(ports.contains(&(161, "udp".to_string())));
+        assert!(ports.contains(&(500, "udp".to_string())));
+    }
+
+    #[test]
+    fn test_parse_port_entries_udp_open_filtered() {
+        // both "open|filtered" and plain "open" udp ports must reach the report
+        let entries = parse_port_entries(NMAP_UDP_FILTERED);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.0 == 161 && e.1 == "udp" && e.2 == "snmp")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.0 == 500 && e.1 == "udp" && e.2 == "isakmp")
+        );
+    }
+
+    #[test]
+    fn test_has_port() {
+        let ports = parse_open_ports(NMAP_TCP_OUTPUT);
+        assert!(has_port(&ports, 22, "tcp"));
+        assert!(has_port(&ports, 443, "tcp"));
+        assert!(!has_port(&ports, 22, "udp"));
+        assert!(!has_port(&ports, 9999, "tcp"));
+    }
+
+    #[test]
+    fn test_parse_port_entries() {
+        let entries = parse_port_entries(NMAP_TCP_OUTPUT);
+        assert_eq!(entries.len(), 5);
+
+        let ssh = &entries[0];
+        assert_eq!(ssh.0, 22);
+        assert_eq!(ssh.1, "tcp");
+        assert_eq!(ssh.2, "ssh");
+        assert!(ssh.3.contains("OpenSSH"));
+
+        let mysql = entries.iter().find(|e| e.0 == 3306).unwrap();
+        assert_eq!(mysql.2, "mysql");
+    }
+
+    #[test]
+    fn test_parse_port_entries_empty() {
+        let entries = parse_port_entries("nothing to see");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_open_ports_combined() {
+        let ports = extract_open_ports(NMAP_TCP_OUTPUT, NMAP_UDP_OUTPUT);
+        assert!(ports.contains(&22));
+        assert!(ports.contains(&53));
+        assert!(ports.contains(&161));
+        assert!(ports.contains(&3306));
+        // Should be sorted
+        assert_eq!(ports, {
+            let mut sorted = ports.clone();
+            sorted.sort();
+            sorted
+        });
+    }
+
+    #[test]
+    fn test_extract_open_ports_deduplication() {
+        // Same port in both outputs should appear only once
+        let tcp = "22/tcp open ssh";
+        let udp = "";
+        let ports = extract_open_ports(tcp, udp);
+        assert_eq!(ports.iter().filter(|&&p| p == 22).count(), 1);
+    }
+
+    #[test]
+    fn test_extract_open_ports_empty() {
+        let ports = extract_open_ports("", "");
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn vhost_word_is_qualified_with_full_box_domain() {
+        assert_eq!(
+            normalize_vhost_candidate("admin", "lame.htb"),
+            Some("admin.lame.htb".to_string())
+        );
+    }
+
+    #[test]
+    fn qualified_gobuster_vhost_is_not_duplicated() {
+        assert_eq!(
+            normalize_vhost_candidate("shop.lame.htb", "lame.htb"),
+            Some("shop.lame.htb".to_string())
+        );
+        assert_eq!(
+            normalize_vhost_candidate("https://shop.lame.htb:443/path", "lame.htb"),
+            Some("shop.lame.htb".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_vhost_candidate_is_rejected() {
+        assert_eq!(normalize_vhost_candidate("../bad", "lame.htb"), None);
+    }
+
+    // ── banner width helpers ──────────────────────────────────────
+    // The box is colored (byte-heavy with ANSI), so the only thing worth
+    // asserting is the *visible* width — that's what keeps the right border
+    // aligned and the corners from drifting.
+
+    const BANNER_TOTAL: usize = BANNER_INNER + 4;
+
+    #[test]
+    fn test_visible_width_strips_ansi() {
+        let s = format!("{} {}", "Lame".bright_yellow().bold(), "10.10.10.3".red());
+        assert_eq!(visible_width(&s), "Lame 10.10.10.3".chars().count());
+    }
+
+    #[test]
+    fn test_rows_and_borders_share_one_width() {
+        let title = format!(
+            "{} {} {}",
+            "pwnbox".green(),
+            "·".dimmed(),
+            "HackTheBox".magenta()
+        );
+        assert_eq!(visible_width(&banner_top(&title)), BANNER_TOTAL);
+        assert_eq!(visible_width(&banner_bottom()), BANNER_TOTAL);
+        assert_eq!(visible_width(&banner_row("")), BANNER_TOTAL);
+        assert_eq!(visible_width(&banner_row(&"x".repeat(20))), BANNER_TOTAL);
+        assert_eq!(
+            visible_width(&banner_kv("started", &"2026-06-14".cyan().to_string())),
+            BANNER_TOTAL
+        );
+    }
+
+    #[test]
+    fn test_banner_top_never_panics_on_long_title() {
+        // A title far wider than the box must not underflow/panic — it just
+        // yields zero dashes (this is the bug the previous rewrite had).
+        let long = "x".repeat(BANNER_INNER + 50);
+        let top = banner_top(&long);
+        assert!(visible_width(&top) >= BANNER_INNER);
+    }
+
+    #[test]
+    fn test_truncate_tail() {
+        assert_eq!(truncate_tail("short", 10), "short");
+        assert_eq!(truncate_tail("abcdefgh", 4), "…fgh"); // keeps the tail
+        assert_eq!(truncate_tail("abc", 0), "");
+        // never exceeds the budget, even for a very long path
+        assert!(truncate_tail(&"p".repeat(100), 20).chars().count() <= 20);
+    }
+
+    #[test]
+    fn test_visible_width_counts_wide_glyphs() {
+        assert_eq!(visible_width("⚡"), 2); // emoji occupies 2 terminal cells
+        assert_eq!(visible_width("↻"), 1);
+        assert_eq!(visible_width("→"), 1);
+        // a mode row carrying an emoji must still pad out to the full width
+        let row = banner_kv("mode", &format!("{} fast", "⚡".yellow()));
+        assert_eq!(visible_width(&row), BANNER_TOTAL);
+    }
+}

@@ -1,0 +1,71 @@
+# pwnbox configuration
+# Config search order: ./config.toml → ~/.config/pwnbox/config.toml → built-in defaults
+# CLI flags always override config values.
+# Generate this file with: pwnbox --init-config
+
+[defaults]
+timeout = 300          # Global timeout per command (seconds)
+ferox_threads = 50     # Feroxbuster thread count
+fast = false           # Skip UDP, vhost scanning, use smaller wordlists
+verbose = false        # Show full tool output
+
+[wordlists]
+# Directory brute-forcing (feroxbuster)
+dir_medium = [
+    "/opt/SecLists/Discovery/Web-Content/raft-medium-directories.txt",
+    "/opt/SecLists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
+    "/usr/share/dirb/wordlists/common.txt",
+]
+dir_small = [
+    "/opt/SecLists/Discovery/Web-Content/common.txt",
+    "/usr/share/dirb/wordlists/common.txt",
+]
+
+# DNS / vhost brute-forcing
+dns_subdomains = [
+    "/opt/SecLists/Discovery/DNS/subdomains-top1million-5000.txt",
+    "/opt/SecLists/Discovery/DNS/namelist.txt",
+    "/usr/share/dnsrecon/subdomains-top1mil-5000.txt",
+]
+
+# Username wordlists
+usernames = [
+    "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt",
+    "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
+]
+usernames_short = [
+    "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
+    "/usr/share/metasploit-framework/data/wordlists/unix_users.txt",
+]
+
+# Password wordlists (for nmap brute scripts etc.)
+passwords_short = [
+    "/opt/SecLists/Passwords/Common-Credentials/best15.txt",
+    "/opt/SecLists/Passwords/Common-Credentials/top-20-common-SSH-passwords.txt",
+]
+
+# SNMP community string wordlists (for onesixtyone bruteforce)
+snmp = [
+    "/opt/SecLists/Discovery/SNMP/snmp.txt",
+    "/opt/SecLists/Discovery/SNMP/common-snmp-community-strings-onesixtyone.txt",
+]
+
+[tools]
+# Override tool paths if they're not in $PATH.
+# Leave empty ("") to use $PATH lookup (default).
+nmap = ""
+rustscan = ""
+feroxbuster = ""
+ffuf = ""
+gobuster = ""
+whatweb = ""
+curl = ""
+dig = ""
+kerbrute = ""
+enum4linux_ng = ""
+smbclient = ""
+crackmapexec = ""
+ldapsearch = ""
+snmpwalk = ""
+showmount = ""
+smtp_user_enum = ""
