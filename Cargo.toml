@@ -7,7 +7,7 @@ authors = ["uall"]
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "fs", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "fs", "sync", "signal"] }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
 anyhow = "1"

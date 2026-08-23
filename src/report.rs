@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub struct JsonReport {
     pub os_guess: String,
     pub mode: String,
     pub ports: Vec<PortEntry>,
-    pub services: HashMap<String, Vec<String>>,
+    pub services: BTreeMap<String, Vec<String>>,
     pub hostnames: Vec<String>,
     pub vulnerabilities: Vec<String>,
     pub next_steps: Vec<String>,
@@ -36,6 +36,17 @@ pub struct PortEntry {
     pub state: String,
     pub service: String,
     pub version: String,
+}
+
+/// Write `content` to a temporary file next to `path`, then atomically rename it.
+///
+/// This guarantees that `path` is never in a partially-written state: readers
+/// either see the old file or the new one, never a truncated intermediate.
+async fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    tokio::fs::write(&tmp, content).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
 }
 
 impl Report {
@@ -62,8 +73,7 @@ impl Report {
     pub async fn write_to_file(&self, path: &Path) -> Result<()> {
         let lines = self.lines.lock().await;
         let content = lines.join("\n");
-        tokio::fs::write(path, content).await?;
-        Ok(())
+        write_atomically(path, content.as_bytes()).await
     }
 
     pub async fn json_mut(&self) -> tokio::sync::MutexGuard<'_, JsonReport> {
@@ -73,8 +83,15 @@ impl Report {
     pub async fn write_json(&self, path: &Path) -> Result<()> {
         let data = self.json_data.lock().await;
         let json = serde_json::to_string_pretty(&*data)?;
-        tokio::fs::write(path, json).await?;
-        Ok(())
+        write_atomically(path, json.as_bytes()).await
+    }
+
+    /// Write the current report state, even if the scan was interrupted.
+    ///
+    /// This is a semantic alias for `write_to_file`; the write itself is atomic
+    /// so a partial write can never leave a corrupt report on disk.
+    pub async fn write_partial(&self, path: &Path) -> Result<()> {
+        self.write_to_file(path).await
     }
 
     pub async fn add_port(
@@ -243,5 +260,17 @@ mod tests {
         let data = a.json_mut().await;
         assert_eq!(data.vulnerabilities.len(), 2);
         assert_eq!(data.ports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn services_are_sorted_alphabetically() {
+        let r = Report::new();
+        r.add_service_finding("web", "dir: /admin").await;
+        r.add_service_finding("ssh", "root login").await;
+        r.add_service_finding("web", "title: Login").await;
+
+        let data = r.json_mut().await;
+        let keys: Vec<String> = data.services.keys().cloned().collect();
+        assert_eq!(keys, vec!["ssh", "web"]);
     }
 }

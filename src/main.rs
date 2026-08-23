@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -308,6 +308,52 @@ fn has_port(ports: &HashSet<(u16, String)>, port: u16, proto: &str) -> bool {
     ports.iter().any(|(p, pr)| *p == port && pr == proto)
 }
 
+/// Build a port -> service-name map for the given protocol.
+fn port_service_map(output: &str, proto: &str) -> HashMap<u16, String> {
+    parse_port_entries(output)
+        .into_iter()
+        .filter(|(_, p, _, _)| p == proto)
+        .map(|(port, _, service, _)| (port, service))
+        .collect()
+}
+
+/// Decide which TCP ports belong to a service, using nmap's service name first
+/// and falling back to well-known ports if no name matched.
+///
+/// Returns ports in a stable order: service-name matches first (sorted by port),
+/// then open fallback ports (in the order given).
+fn detect_service_ports(
+    services: &HashMap<u16, String>,
+    names: &[&str],
+    fallback_ports: &[u16],
+    open_ports: &HashSet<(u16, String)>,
+) -> Vec<u16> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Ports whose nmap service name matches any of the requested names.
+    let mut named: Vec<u16> = services
+        .iter()
+        .filter(|(_, svc)| names.contains(&svc.as_str()))
+        .map(|(&port, _)| port)
+        .collect();
+    named.sort_unstable();
+    for port in named {
+        if seen.insert(port) {
+            result.push(port);
+        }
+    }
+
+    // Well-known fallback ports that are actually open.
+    for &port in fallback_ports {
+        if has_port(open_ports, port, "tcp") && seen.insert(port) {
+            result.push(port);
+        }
+    }
+
+    result
+}
+
 /// Pretty-print open port lines from nmap output.
 fn print_port_lines(output: &str, line_re: &Regex) {
     let lines: Vec<&str> = output.lines().filter(|l| line_re.is_match(l)).collect();
@@ -588,15 +634,12 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // box_name becomes part of the output path (~/htb/<box>/) — keep it from
-    // escaping that directory via path separators or traversal
-    if box_name.is_empty()
-        || box_name.contains('/')
-        || box_name.contains('\\')
-        || box_name.contains("..")
-    {
+    // box_name becomes part of the output path (~/htb/<box>/) and generated
+    // hostnames — reject anything that could escape the directory or contain
+    // shell metacharacters.
+    if !config::is_valid_box_name(box_name) {
         eprintln!(
-            "{} Invalid box name {:?} — must not contain '/', '\\' or '..'",
+            "{} Invalid box name {:?} — must be alphanumeric/hyphen/underscore, 1-64 chars",
             "[!]".red().bold(),
             box_name
         );
@@ -616,7 +659,6 @@ async fn main() -> Result<()> {
         &file_cfg,
     );
     let report = Report::new();
-    let start = Instant::now();
 
     // apply the resolved timeout/verbosity globally so every command honours them
     runner::set_default_timeout(scan_cfg.timeout);
@@ -637,6 +679,55 @@ async fn main() -> Result<()> {
 
     // Check only tools needed by the resolved scan plan, including overrides.
     tools::check_all(&scan_cfg).await?;
+
+    // Prepare report clones for the signal handler so an interrupt can flush a
+    // partial report even while the pipeline is still running.
+    let report_for_signal = report.clone();
+    let report_path = cfg.report_path.clone();
+    let json_path = if cli.json {
+        Some(cfg.report_path.with_extension("json"))
+    } else {
+        None
+    };
+
+    let scan = run_scan(cli, cfg, scan_cfg, report);
+    let signal = async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate.recv() => {},
+        }
+        println!(
+            "\n{} Interrupted — writing partial report...",
+            "[!]".yellow()
+        );
+        if let Err(e) = report_for_signal.write_partial(&report_path).await {
+            eprintln!("Failed to write partial report: {e}");
+        }
+        if let Some(jp) = json_path
+            && let Err(e) = report_for_signal.write_json(&jp).await
+        {
+            eprintln!("Failed to write partial JSON report: {e}");
+        }
+        std::process::exit(130);
+    };
+
+    tokio::select! {
+        res = scan => res,
+        _ = signal => Ok(()),
+    }
+}
+
+/// Execute the full scan pipeline.
+///
+/// This runs inside `tokio::select!` in `main` alongside a signal handler, so it
+/// can be cancelled at any point; the shared `Report` is then flushed by the
+/// signal handler.
+async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report) -> Result<()> {
+    let start = Instant::now();
 
     // start building the report
     report
@@ -725,6 +816,7 @@ async fn main() -> Result<()> {
 
     // parse ports once so we can decide which service scans to run
     let tcp_ports = parse_open_ports(&nmap_output);
+    let tcp_services = port_service_map(&nmap_output, "tcp");
 
     // grab hostnames from SSL certs on HTTPS ports — a port counts as SSL if it's
     // a well-known TLS port or *its own* nmap line mentions ssl (checked per-port,
@@ -894,8 +986,13 @@ async fn main() -> Result<()> {
     // section can't interleave with another task's; merged back on collection
     let mut svc_handles: Vec<(&str, JoinHandle<Result<Report>>)> = Vec::new();
 
+    // Services without a configurable port are triggered by nmap service name
+    // *or* by their well-known fallback port.
+
     // SSH
-    if has_port(&tcp_ports, 22, "tcp") && !scan_cfg.should_skip("ssh") {
+    if !detect_service_ports(&tcp_services, &["ssh"], &[22], &tcp_ports).is_empty()
+        && !scan_cfg.should_skip("ssh")
+    {
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
@@ -908,7 +1005,9 @@ async fn main() -> Result<()> {
     }
 
     // FTP
-    if has_port(&tcp_ports, 21, "tcp") && !scan_cfg.should_skip("ftp") {
+    if !detect_service_ports(&tcp_services, &["ftp"], &[21], &tcp_ports).is_empty()
+        && !scan_cfg.should_skip("ftp")
+    {
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
@@ -922,7 +1021,9 @@ async fn main() -> Result<()> {
     }
 
     // SMB
-    if has_port(&tcp_ports, 445, "tcp") && !scan_cfg.should_skip("smb") {
+    if !detect_service_ports(&tcp_services, &["microsoft-ds", "smb"], &[445], &tcp_ports).is_empty()
+        && !scan_cfg.should_skip("smb")
+    {
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
@@ -936,7 +1037,9 @@ async fn main() -> Result<()> {
     }
 
     // RPC
-    if has_port(&tcp_ports, 135, "tcp") && !scan_cfg.should_skip("rpc") {
+    if !detect_service_ports(&tcp_services, &["msrpc", "rpc"], &[135], &tcp_ports).is_empty()
+        && !scan_cfg.should_skip("rpc")
+    {
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
@@ -950,7 +1053,8 @@ async fn main() -> Result<()> {
     }
 
     // NFS
-    if (has_port(&tcp_ports, 2049, "tcp") || has_port(&tcp_ports, 111, "tcp"))
+    if !detect_service_ports(&tcp_services, &["nfs", "rpcbind"], &[2049, 111], &tcp_ports)
+        .is_empty()
         && !scan_cfg.should_skip("nfs")
     {
         let r = Report::new();
@@ -965,34 +1069,47 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // MySQL
-    if has_port(&tcp_ports, 3306, "tcp") && !scan_cfg.should_skip("mysql") {
+    // MySQL — port-aware
+    for mysql_port in detect_service_ports(&tcp_services, &["mysql"], &[3306], &tcp_ports) {
+        if scan_cfg.should_skip("mysql") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
             "MySQL",
             tokio::spawn(async move {
-                scans::mysql::check(&ip, 3306, &r).await?;
+                scans::mysql::check(&ip, mysql_port, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
-    // PostgreSQL
-    if has_port(&tcp_ports, 5432, "tcp") && !scan_cfg.should_skip("postgres") {
+    // PostgreSQL — port-aware
+    for postgres_port in detect_service_ports(
+        &tcp_services,
+        &["postgresql", "postgres"],
+        &[5432],
+        &tcp_ports,
+    ) {
+        if scan_cfg.should_skip("postgres") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
             "PostgreSQL",
             tokio::spawn(async move {
-                scans::postgres::check(&ip, 5432, &r).await?;
+                scans::postgres::check(&ip, postgres_port, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
     // Redis
-    if has_port(&tcp_ports, 6379, "tcp") && !scan_cfg.should_skip("redis") {
+    if !detect_service_ports(&tcp_services, &["redis"], &[6379], &tcp_ports).is_empty()
+        && !scan_cfg.should_skip("redis")
+    {
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
@@ -1004,64 +1121,79 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // WinRM
-    for winrm_port in [5985u16, 5986] {
-        if has_port(&tcp_ports, winrm_port, "tcp") && !scan_cfg.should_skip("winrm") {
-            let r = Report::new();
-            let ip = cfg.ip.clone();
-            let sc = scan_cfg.clone();
-            svc_handles.push((
-                "WinRM",
-                tokio::spawn(async move {
-                    scans::winrm::check(&ip, winrm_port, &sc, &r).await?;
-                    Ok(r)
-                }),
-            ));
-            break; // only need to check one WinRM port
-        }
+    // WinRM — first matching port only
+    if let Some(winrm_port) = detect_service_ports(
+        &tcp_services,
+        &["winrm", "wsman"],
+        &[5985, 5986],
+        &tcp_ports,
+    )
+    .first()
+    .copied()
+        && !scan_cfg.should_skip("winrm")
+    {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "WinRM",
+            tokio::spawn(async move {
+                scans::winrm::check(&ip, winrm_port, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
     }
 
-    // MSSQL
-    if has_port(&tcp_ports, 1433, "tcp") && !scan_cfg.should_skip("mssql") {
+    // MSSQL — port-aware
+    for mssql_port in
+        detect_service_ports(&tcp_services, &["ms-sql-s", "mssql"], &[1433], &tcp_ports)
+    {
+        if scan_cfg.should_skip("mssql") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
         svc_handles.push((
             "MSSQL",
             tokio::spawn(async move {
-                scans::mssql::check(&ip, 1433, &sc, &r).await?;
+                scans::mssql::check(&ip, mssql_port, &sc, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
-    // SMTP
-    for smtp_port in [25u16, 465, 587] {
-        if has_port(&tcp_ports, smtp_port, "tcp") && !scan_cfg.should_skip("smtp") {
-            let r = Report::new();
-            let ip = cfg.ip.clone();
-            let sc = scan_cfg.clone();
-            svc_handles.push((
-                "SMTP",
-                tokio::spawn(async move {
-                    scans::smtp::check(&ip, smtp_port, &sc, &r).await?;
-                    Ok(r)
-                }),
-            ));
-            break; // one SMTP scan is enough
-        }
+    // SMTP — first matching port only
+    if let Some(smtp_port) = detect_service_ports(
+        &tcp_services,
+        &["smtp", "smtps", "submission"],
+        &[25, 465, 587],
+        &tcp_ports,
+    )
+    .first()
+    .copied()
+        && !scan_cfg.should_skip("smtp")
+    {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        svc_handles.push((
+            "SMTP",
+            tokio::spawn(async move {
+                scans::smtp::check(&ip, smtp_port, &sc, &r).await?;
+                Ok(r)
+            }),
+        ));
     }
 
     // LDAP runs first (not in parallel) because Kerberos needs the domain
     let mut ldap_domain: Option<String> = None;
-    if (has_port(&tcp_ports, 389, "tcp") || has_port(&tcp_ports, 636, "tcp"))
+    if let Some(ldap_port) =
+        detect_service_ports(&tcp_services, &["ldap", "ldaps"], &[389, 636], &tcp_ports)
+            .first()
+            .copied()
         && !scan_cfg.should_skip("ldap")
     {
-        let ldap_port = if has_port(&tcp_ports, 389, "tcp") {
-            389
-        } else {
-            636
-        };
         println!("{} LDAP enumeration on port {ldap_port}...", "[*]".cyan());
         ldap_domain = match scans::ldap::enumerate(&cfg.ip, ldap_port, &scan_cfg, &report).await {
             Ok(domain) => domain,
@@ -1135,7 +1267,15 @@ async fn main() -> Result<()> {
     }
 
     // kerberos uses the domain we found from LDAP (if any)
-    if has_port(&tcp_ports, 88, "tcp") && !scan_cfg.should_skip("kerberos") {
+    if !detect_service_ports(
+        &tcp_services,
+        &["kerberos-sec", "kerberos"],
+        &[88],
+        &tcp_ports,
+    )
+    .is_empty()
+        && !scan_cfg.should_skip("kerberos")
+    {
         println!("\n{} Kerberos enumeration...", "[*]".cyan());
         if let Err(e) = scans::kerberos::enumerate(
             &cfg.ip,
@@ -1754,6 +1894,60 @@ PORT     STATE         SERVICE
         assert!(has_port(&ports, 443, "tcp"));
         assert!(!has_port(&ports, 22, "udp"));
         assert!(!has_port(&ports, 9999, "tcp"));
+    }
+
+    #[test]
+    fn test_port_service_map() {
+        let services = port_service_map(NMAP_TCP_OUTPUT, "tcp");
+        assert_eq!(services.get(&22), Some(&"ssh".to_string()));
+        assert_eq!(services.get(&80), Some(&"http".to_string()));
+        assert_eq!(services.get(&53), None); // UDP
+    }
+
+    #[test]
+    fn test_detect_service_ports_finds_non_standard_ssh() {
+        let output = "2222/tcp open ssh OpenSSH 8.9";
+        let ports = parse_open_ports(output);
+        let services = port_service_map(output, "tcp");
+        let detected = detect_service_ports(&services, &["ssh"], &[22], &ports);
+        assert_eq!(detected, vec![2222]);
+    }
+
+    #[test]
+    fn test_detect_service_ports_prefers_service_name_over_fallback() {
+        // 2222 is ssh, 22 is also open but not identified as ssh
+        let output = "22/tcp open tcpwrapped\n2222/tcp open ssh OpenSSH 8.9";
+        let ports = parse_open_ports(output);
+        let services = port_service_map(output, "tcp");
+        let detected = detect_service_ports(&services, &["ssh"], &[22], &ports);
+        assert_eq!(detected, vec![2222, 22]);
+    }
+
+    #[test]
+    fn test_detect_service_ports_redis_on_non_standard_port() {
+        let output = "6380/tcp open redis Redis 7.0";
+        let ports = parse_open_ports(output);
+        let services = port_service_map(output, "tcp");
+        let detected = detect_service_ports(&services, &["redis"], &[6379], &ports);
+        assert_eq!(detected, vec![6380]);
+    }
+
+    #[test]
+    fn test_detect_service_ports_winrm_first_only() {
+        let output = "5985/tcp open winrm Microsoft HTTPAPI";
+        let ports = parse_open_ports(output);
+        let services = port_service_map(output, "tcp");
+        let detected = detect_service_ports(&services, &["winrm"], &[5985, 5986], &ports);
+        assert_eq!(detected, vec![5985]);
+    }
+
+    #[test]
+    fn test_detect_service_ports_empty_when_no_match() {
+        let output = "80/tcp open http";
+        let ports = parse_open_ports(output);
+        let services = port_service_map(output, "tcp");
+        let detected = detect_service_ports(&services, &["ssh"], &[22], &ports);
+        assert!(detected.is_empty());
     }
 
     #[test]

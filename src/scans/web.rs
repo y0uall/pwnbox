@@ -12,9 +12,10 @@ use crate::report::Report;
 use crate::runner;
 
 // HTTP(S) service lines in nmap output, plus the header/body fields we scrape.
-static RE_HTTP_PORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^(\d+)/tcp\s+open\s+.*(https?|ssl.http|http-proxy|http-alt)").unwrap()
-});
+// Match any nmap service field that contains "http" — this covers http, https,
+// ssl/http, http-alt, https-alt, http-proxy, etc.
+static RE_HTTP_PORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(\d+)/tcp\s+open\s+\S*http\S*").unwrap());
 static RE_HTTP_STATUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"HTTP/\S+\s+(\d+)").unwrap());
 static RE_HTTP_SERVER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^server:\s*(.+)").unwrap());
@@ -372,4 +373,27 @@ pub async fn enumerate(
     }
 
     Ok(background_tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_http_ports;
+
+    #[test]
+    fn detects_http_https_and_variants() {
+        let output = "\
+80/tcp   open  http
+443/tcp  open  ssl/http
+8080/tcp open  http-alt
+8443/tcp open  https-alt
+9090/tcp open  http-proxy
+22/tcp   open  ssh";
+        let ports = detect_http_ports(output);
+        assert!(ports.iter().any(|(p, s)| *p == 80 && s == "http"));
+        assert!(ports.iter().any(|(p, s)| *p == 443 && s == "https"));
+        assert!(ports.iter().any(|(p, s)| *p == 8080 && s == "http"));
+        assert!(ports.iter().any(|(p, s)| *p == 8443 && s == "https"));
+        assert!(ports.iter().any(|(p, s)| *p == 9090 && s == "http"));
+        assert!(!ports.iter().any(|(p, _)| *p == 22));
+    }
 }

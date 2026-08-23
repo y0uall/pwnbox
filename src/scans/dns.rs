@@ -9,9 +9,12 @@ use crate::hosts;
 use crate::report::Report;
 use crate::runner;
 
-// Any *.htb hostname (with an optional trailing dot) inside dig/AXFR output.
-static RE_HTB_HOST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)[a-zA-Z0-9._-]+\.htb\.?").unwrap());
+// Any plausible hostname inside dig/AXFR output. The result is later filtered
+// through `hosts::is_valid_hostname` so arbitrary tokens don't reach /etc/hosts.
+// The match must contain at least one letter so plain IP addresses are ignored.
+static RE_HOST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[a-zA-Z0-9._-]*[a-z][a-zA-Z0-9._-]*\.[a-zA-Z0-9._-]+\.?").unwrap()
+});
 
 /// Try zone transfer + reverse DNS, return any hostnames we find.
 pub async fn recon(
@@ -50,7 +53,7 @@ pub async fn recon(
             continue; // refused/failed AXFR is an expected negative result
         }
         let before = discovered.len();
-        for cap in RE_HTB_HOST.find_iter(&output) {
+        for cap in RE_HOST.find_iter(&output) {
             let name = cap.as_str().trim_end_matches('.').to_lowercase();
             if !discovered.contains(&name) {
                 discovered.push(name);
@@ -114,4 +117,27 @@ pub async fn recon(
     }
 
     Ok(discovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RE_HOST;
+
+    #[test]
+    fn extracts_generic_domains_from_axfr_output() {
+        let output = "sub.corp.local.\nadmin.inlanefreight.local.\nhost.htb.";
+        let hosts: Vec<String> = RE_HOST
+            .find_iter(output)
+            .map(|m| m.as_str().trim_end_matches('.').to_lowercase())
+            .collect();
+        assert!(hosts.contains(&"sub.corp.local".to_string()));
+        assert!(hosts.contains(&"admin.inlanefreight.local".to_string()));
+        assert!(hosts.contains(&"host.htb".to_string()));
+    }
+
+    #[test]
+    fn does_not_match_plain_ips() {
+        let output = "10.10.10.3\n192.168.1.1";
+        assert!(RE_HOST.find_iter(output).next().is_none());
+    }
 }

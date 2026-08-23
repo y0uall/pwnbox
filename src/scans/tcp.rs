@@ -15,8 +15,10 @@ use crate::scans::RE_PORT_LINE;
 static RE_RUSTSCAN_PORTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9,]+)\]").unwrap());
 static RE_VULN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(VULNERABLE|CVE-\d{4}-\d+)").unwrap());
+// Generic hostname extraction: no longer limited to *.htb. Invalid or local-only
+// names are filtered out by `hosts::is_valid_hostname` before /etc/hosts is touched.
 static RE_SSL_HOST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:commonName\s*=\s*|DNS:)([a-zA-Z0-9._-]+\.htb)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?:commonName\s*=\s*|DNS:)([a-zA-Z0-9._-]+)").unwrap());
 static RE_REDIRECT_HOST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"redirect to https?://([a-zA-Z0-9._-]+)").unwrap());
 static RE_SERVICE_HOST: LazyLock<Regex> =
@@ -373,4 +375,65 @@ pub async fn ssl_hostnames(
     }
 
     Ok(new_hosts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_host_regex_matches_non_htb_domains() {
+        let output = "commonName=dc01.corp.local\nDNS:web.inlanefreight.local\nDNS:host.htb";
+        let hosts: Vec<String> = RE_SSL_HOST
+            .captures_iter(output)
+            .map(|c| c[1].to_lowercase())
+            .collect();
+        assert!(hosts.contains(&"dc01.corp.local".to_string()));
+        assert!(hosts.contains(&"web.inlanefreight.local".to_string()));
+        assert!(hosts.contains(&"host.htb".to_string()));
+    }
+
+    #[test]
+    fn vuln_block_parsing_extracts_cve() {
+        let output = "\n| VULNERABLE:
+|   SMBv1 enabled
+|     State: VULNERABLE
+|     CVE-2017-0144
+|_
+";
+        let mut vulns: Vec<String> = Vec::new();
+        let mut in_vuln_block = false;
+        let mut current_vuln = String::new();
+
+        for line in output.lines() {
+            if line.contains("VULNERABLE") {
+                in_vuln_block = true;
+                current_vuln = line.trim().to_string();
+            } else if in_vuln_block {
+                if line.starts_with("|_") {
+                    if !current_vuln.is_empty() {
+                        vulns.push(current_vuln.clone());
+                    }
+                    in_vuln_block = false;
+                    current_vuln.clear();
+                } else if line.starts_with("|") {
+                    if let Some(cap) = RE_VULN.captures(line)
+                        && cap[0].to_ascii_uppercase().starts_with("CVE")
+                    {
+                        current_vuln.push_str(&format!(" ({})", &cap[0]));
+                    }
+                } else {
+                    in_vuln_block = false;
+                    if !current_vuln.is_empty() {
+                        vulns.push(current_vuln.clone());
+                    }
+                    current_vuln.clear();
+                }
+            }
+        }
+
+        assert_eq!(vulns.len(), 1);
+        assert!(vulns[0].contains("VULNERABLE"));
+        assert!(vulns[0].contains("CVE-2017-0144"));
+    }
 }

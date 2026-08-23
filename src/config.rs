@@ -1,10 +1,38 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use chrono::Local;
 use colored::Colorize;
+use regex::Regex;
 use serde::Deserialize;
+
+/// Where a loaded config file came from. This matters for security:
+/// `[tools]` overrides from an untrusted local directory must be ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ConfigSource {
+    /// Default value; should not be observable after `FileConfig::load`.
+    #[default]
+    Unknown,
+    /// `./config.toml` in the current working directory.
+    Local,
+    /// `~/.config/pwnbox/config.toml`.
+    User,
+    /// Explicit path passed via `--config`.
+    Explicit,
+}
+
+// Same character class as a hostname label, but no dot requirement — a box name
+// becomes a directory and a generated hostname suffix.
+static VALID_BOX_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$").unwrap());
+
+/// Validate a box name before it is used as a directory or hostname component.
+/// Rejects path separators, shell metacharacters, spaces, and over-long names.
+pub fn is_valid_box_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && VALID_BOX_NAME.is_match(name)
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct FileConfig {
@@ -14,6 +42,9 @@ pub struct FileConfig {
     pub wordlists: WordlistsConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// Not serialized; tracks which file was actually loaded.
+    #[serde(skip, default)]
+    pub source: ConfigSource,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -78,6 +109,28 @@ pub struct ToolsConfig {
     pub smtp_user_enum: String,
 }
 
+impl ToolsConfig {
+    /// True if no tool override is set at all.
+    pub fn is_empty(&self) -> bool {
+        self.nmap.is_empty()
+            && self.rustscan.is_empty()
+            && self.feroxbuster.is_empty()
+            && self.ffuf.is_empty()
+            && self.gobuster.is_empty()
+            && self.whatweb.is_empty()
+            && self.curl.is_empty()
+            && self.dig.is_empty()
+            && self.kerbrute.is_empty()
+            && self.enum4linux_ng.is_empty()
+            && self.smbclient.is_empty()
+            && self.crackmapexec.is_empty()
+            && self.ldapsearch.is_empty()
+            && self.snmpwalk.is_empty()
+            && self.showmount.is_empty()
+            && self.smtp_user_enum.is_empty()
+    }
+}
+
 // Fallback wordlist paths if nothing is set in config
 impl WordlistsConfig {
     pub fn with_defaults(mut self) -> Self {
@@ -132,14 +185,14 @@ impl WordlistsConfig {
 impl FileConfig {
     /// Tries explicit path, then ./config.toml, then ~/.config/pwnbox/config.toml.
     pub fn load(explicit_path: Option<&str>) -> Result<Self> {
-        let candidates: Vec<PathBuf> = if let Some(p) = explicit_path {
-            vec![PathBuf::from(p)]
+        let (candidates, explicit): (Vec<PathBuf>, bool) = if let Some(p) = explicit_path {
+            (vec![PathBuf::from(p)], true)
         } else {
             let mut c = vec![PathBuf::from("config.toml")];
             if let Ok(home) = std::env::var("HOME") {
                 c.push(PathBuf::from(home).join(".config/pwnbox/config.toml"));
             }
-            c
+            (c, false)
         };
 
         for path in &candidates {
@@ -147,6 +200,25 @@ impl FileConfig {
                 let content = std::fs::read_to_string(path)?;
                 let mut cfg: FileConfig = toml::from_str(&content)?;
                 cfg.wordlists = cfg.wordlists.with_defaults();
+
+                cfg.source = if explicit {
+                    ConfigSource::Explicit
+                } else if path == &candidates[0] {
+                    ConfigSource::Local
+                } else {
+                    ConfigSource::User
+                };
+
+                // Security: a ./config.toml from an untrusted directory must not
+                // be allowed to redirect tool paths to arbitrary binaries.
+                if cfg.source == ConfigSource::Local && !cfg.tools.is_empty() {
+                    println!(
+                        "{} Ignoring [tools] overrides from local config.toml",
+                        "[!]".yellow()
+                    );
+                    cfg.tools = ToolsConfig::default();
+                }
+
                 println!(
                     "{} Config loaded: {}",
                     "[*]".cyan(),
@@ -246,6 +318,30 @@ pub struct ScanConfig {
     pub tools: ToolsConfig,
 }
 
+/// Modules the user can disable with `--skip`.
+pub const KNOWN_MODULES: &[&str] = &[
+    "connectivity",
+    "dns",
+    "tcp",
+    "udp",
+    "vuln",
+    "web",
+    "ssh",
+    "ftp",
+    "smb",
+    "rpc",
+    "nfs",
+    "mysql",
+    "postgres",
+    "redis",
+    "winrm",
+    "mssql",
+    "smtp",
+    "ldap",
+    "kerberos",
+    "snmp",
+];
+
 impl ScanConfig {
     /// Merges CLI flags with config file values (CLI wins).
     pub fn new(
@@ -263,6 +359,16 @@ impl ScanConfig {
             ferox_threads.unwrap_or_else(|| file_cfg.defaults.ferox_threads.unwrap_or(50));
 
         let mut skip_set: HashSet<String> = skip.iter().map(|s| s.to_lowercase()).collect();
+        for svc in &skip_set {
+            if !KNOWN_MODULES.contains(&svc.as_str()) {
+                println!(
+                    "{} Unknown --skip value '{}' (ignored). Known modules: {}",
+                    "[!]".yellow(),
+                    svc,
+                    KNOWN_MODULES.join(", ")
+                );
+            }
+        }
         if fast {
             skip_set.insert("udp".to_string());
         }
@@ -465,5 +571,132 @@ dir_medium = ["/custom/wordlist.txt"]
         assert_eq!(cfg.defaults.timeout, Some(120));
         assert_eq!(cfg.defaults.fast, Some(true));
         assert_eq!(cfg.wordlists.dir_medium, vec!["/custom/wordlist.txt"]);
+    }
+
+    #[test]
+    fn test_valid_box_names() {
+        assert!(is_valid_box_name("Lame"));
+        assert!(is_valid_box_name("legacy_01"));
+        assert!(is_valid_box_name("my-box"));
+        assert!(is_valid_box_name("a"));
+        assert!(is_valid_box_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn test_invalid_box_names() {
+        assert!(!is_valid_box_name(""));
+        assert!(!is_valid_box_name("has space"));
+        assert!(!is_valid_box_name("has/slash"));
+        assert!(!is_valid_box_name("has\\\\backslash"));
+        assert!(!is_valid_box_name(".."));
+        assert!(!is_valid_box_name("$(id)"));
+        assert!(!is_valid_box_name("-leading-dash"));
+        assert!(!is_valid_box_name("trailing-dash-"));
+        assert!(!is_valid_box_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn test_unknown_skip_value_is_reported() {
+        let file_cfg = FileConfig::default();
+        // "snmb" is a common typo for "smb"; the config should not silently
+        // treat it as a valid module name. It is still stored as a skip token
+        // (so should_skip("snmb") is true), but it must not match the real "smb" module.
+        let scan = ScanConfig::new(None, &["snmb".to_string()], None, None, None, &file_cfg);
+        assert!(!scan.should_skip("smb"));
+        assert!(scan.skip.contains("snmb"));
+    }
+
+    #[test]
+    fn test_known_skip_value_is_honoured() {
+        let file_cfg = FileConfig::default();
+        let scan = ScanConfig::new(
+            None,
+            &["SMB".to_string(), "udp".to_string()],
+            None,
+            None,
+            None,
+            &file_cfg,
+        );
+        assert!(scan.should_skip("smb"));
+        assert!(scan.should_skip("udp"));
+    }
+
+    #[test]
+    fn test_tools_config_is_empty() {
+        assert!(ToolsConfig::default().is_empty());
+        let t = ToolsConfig {
+            nmap: "/usr/bin/nmap".to_string(),
+            ..Default::default()
+        };
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn test_explicit_config_keeps_tools_overrides() {
+        let tmp = TmpDir::new("explicit_cfg");
+        let cfg_path = tmp.path().join("pwnbox.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[tools]
+nmap = "/custom/nmap"
+"#,
+        )
+        .unwrap();
+
+        let cfg = FileConfig::load(Some(cfg_path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.source, ConfigSource::Explicit);
+        assert_eq!(cfg.tools.nmap, "/custom/nmap");
+    }
+
+    // Changing the working directory must be serialised so parallel tests don't
+    // see each other's temporary CWD.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_local_config_ignores_tools_overrides() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = TmpDir::new("local_cfg");
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[tools]
+nmap = "/malicious/nmap"
+"#,
+        )
+        .unwrap();
+
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let cfg = FileConfig::load(None).unwrap();
+        std::env::set_current_dir(original).unwrap();
+
+        assert_eq!(cfg.source, ConfigSource::Local);
+        assert!(cfg.tools.nmap.is_empty());
+        assert!(cfg.tools.is_empty());
+    }
+
+    /// Throwaway directory under the system temp dir, removed on drop.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("pwnbox_config_test_{}_{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TmpDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }

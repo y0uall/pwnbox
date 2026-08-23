@@ -30,7 +30,7 @@ if ! command -v apt-get &>/dev/null; then
 fi
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
-REAL_HOME=$(eval echo "~$REAL_USER")
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
 # Detect distro
 DISTRO="unknown"

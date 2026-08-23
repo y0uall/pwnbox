@@ -93,32 +93,57 @@ pub async fn add_hosts(ip: &str, hostnames: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Write to /etc/hosts via `sudo tee` (stdin pipe, no shell involved).
+/// Atomically replace `/etc/hosts` with `content`.
+///
+/// Writes to a temporary file in /tmp first, then uses `sudo install -m 644` to
+/// move it into place. This guarantees that `/etc/hosts` is never observed in a
+/// partially-written state, even if the process is killed mid-write. A timeout
+/// guards against a password prompt or hung sudo.
 async fn write_hosts_sudo(content: &str) -> Result<()> {
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
+    let tmp = format!("/tmp/hosts.pwnbox.{}", std::process::id());
+
+    // write temp file as the current user
+    {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+    }
+
+    // atomically install it as /etc/hosts (preserving permissions)
     let mut child = Command::new("sudo")
-        .args(["tee", "/etc/hosts"])
-        .stdin(std::process::Stdio::piped())
+        .args([
+            "-n",
+            "install",
+            "-m",
+            "644",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            &tmp,
+            "/etc/hosts",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(content.as_bytes()).await?;
-        // drop closes stdin → tee gets EOF
-    }
+    let result = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
 
-    let status = child.wait().await?;
-    if !status.success() {
-        anyhow::bail!(
-            "Failed to write /etc/hosts (sudo tee exited with {})",
-            status
-        );
-    }
+    // best-effort cleanup of the temp file; ignore errors
+    let _ = tokio::fs::remove_file(&tmp).await;
 
-    Ok(())
+    match result {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => {
+            anyhow::bail!("Failed to write /etc/hosts (sudo install exited with {status})")
+        }
+        Ok(Err(e)) => anyhow::bail!("Failed to wait for sudo install: {e}"),
+        Err(_) => anyhow::bail!("sudo install timed out after 30s (passwordless sudo required)"),
+    }
 }
 
 #[cfg(test)]
