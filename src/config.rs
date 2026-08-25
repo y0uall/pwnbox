@@ -133,6 +133,16 @@ impl ToolsConfig {
 
 // Fallback wordlist paths if nothing is set in config
 impl WordlistsConfig {
+    /// The 0.7.0 built-in `usernames` default, verbatim. Configs written by
+    /// `--init-config` on 0.7.0 carry this exact list without the user ever
+    /// having chosen it — count it as "unconfigured" so the new default
+    /// reaches those configs without a manual edit. Any deviation (reordered,
+    /// extended, trimmed) counts as a deliberate choice and is kept.
+    const LEGACY_USERNAMES_DEFAULT: [&'static str; 2] = [
+        "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt",
+        "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
+    ];
+
     pub fn with_defaults(mut self) -> Self {
         if self.dir_medium.is_empty() {
             self.dir_medium = vec![
@@ -154,7 +164,19 @@ impl WordlistsConfig {
                 "/usr/share/dnsrecon/subdomains-top1mil-5000.txt".into(),
             ];
         }
-        if self.usernames.is_empty() {
+        let legacy_usernames = self.usernames.len() == Self::LEGACY_USERNAMES_DEFAULT.len()
+            && self
+                .usernames
+                .iter()
+                .zip(Self::LEGACY_USERNAMES_DEFAULT)
+                .all(|(a, b)| a.as_str() == b);
+        if self.usernames.is_empty() || legacy_usernames {
+            if legacy_usernames {
+                println!(
+                    "{} config.toml still has the 0.7.0 default username wordlist — applying the new default (names.txt first)",
+                    "[*]".cyan()
+                );
+            }
             // names.txt (~10k entries) first: it finishes within the kerbrute
             // timeout, the 8.3M-entry xato list structurally cannot
             self.usernames = vec![
@@ -550,6 +572,33 @@ mod tests {
         assert_eq!(wl.dir_medium, vec!["/my/custom/wordlist.txt".to_string()]);
         // Other fields should get defaults
         assert!(!wl.dir_small.is_empty());
+    }
+
+    #[test]
+    fn legacy_0_7_usernames_default_is_migrated() {
+        // the exact list --init-config wrote on 0.7.0 — never a deliberate
+        // choice, so the new default replaces it
+        let wl = WordlistsConfig {
+            usernames: vec![
+                "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt".into(),
+                "/opt/SecLists/Usernames/top-usernames-shortlist.txt".into(),
+            ],
+            ..Default::default()
+        }
+        .with_defaults();
+        assert_eq!(wl.usernames[0], "/opt/SecLists/Usernames/Names/names.txt");
+    }
+
+    #[test]
+    fn customized_usernames_list_is_not_migrated() {
+        // overlaps the legacy default but deviates (trimmed) — a deliberate
+        // choice that must be kept
+        let wl = WordlistsConfig {
+            usernames: vec!["/opt/SecLists/Usernames/xato-net-10-million-usernames.txt".into()],
+            ..Default::default()
+        }
+        .with_defaults();
+        assert_eq!(wl.usernames.len(), 1);
     }
 
     #[test]
