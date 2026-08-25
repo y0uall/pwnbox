@@ -43,7 +43,15 @@ pub struct PortEntry {
 /// This guarantees that `path` is never in a partially-written state: readers
 /// either see the old file or the new one, never a truncated intermediate.
 async fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // pid alone isn't unique enough: overlapping writes (watch-mode rewrite vs.
+    // signal-path partial write) would share one tmp file and could rename each
+    // other's half-written content (REVIEW.md "Niedrig"). pid+nanos keeps every
+    // in-flight write on its own file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{nanos}", std::process::id()));
     tokio::fs::write(&tmp, content).await?;
     tokio::fs::rename(&tmp, path).await?;
     Ok(())
@@ -164,6 +172,12 @@ impl Report {
 
     pub async fn errors(&self) -> Vec<String> {
         self.json_data.lock().await.errors.clone()
+    }
+
+    /// Test-only accessor for assertions on the collected text lines.
+    #[cfg(test)]
+    pub async fn lines(&self) -> Vec<String> {
+        self.lines.lock().await.clone()
     }
 
     /// Fold another report's contents into this one atomically.

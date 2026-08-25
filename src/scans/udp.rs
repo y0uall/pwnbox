@@ -6,17 +6,18 @@ use colored::Colorize;
 use crate::config::ScanConfig;
 use crate::report::Report;
 use crate::runner;
-use crate::scans::RE_PORT_LINE;
+use crate::scans::port_detail_lines;
 
 /// UDP top-100 scan via sudo nmap. Caches results for resume.
+/// Raw nmap output goes to `raw_dir` (the output dir's `raw/` subdirectory).
 pub async fn scan(
     ip: &str,
-    output_dir: &Path,
+    raw_dir: &Path,
     report: &Report,
     resume: bool,
     scan_cfg: &ScanConfig,
 ) -> Result<String> {
-    let nmap_path = output_dir.join("nmap-udp.txt");
+    let nmap_path = raw_dir.join("nmap-udp.txt");
 
     if resume && nmap_path.exists() {
         let cached = tokio::fs::read_to_string(&nmap_path).await?;
@@ -26,10 +27,7 @@ pub async fn scan(
             nmap_path.display().to_string().yellow()
         );
         report.section("UDP").await;
-        let port_lines: Vec<&str> = cached
-            .lines()
-            .filter(|l| RE_PORT_LINE.is_match(l))
-            .collect();
+        let port_lines = port_detail_lines(&cached);
         if port_lines.is_empty() {
             report.add("  (no results)").await;
         } else {
@@ -79,10 +77,7 @@ pub async fn scan(
     );
 
     report.section("UDP").await;
-    let port_lines: Vec<&str> = output
-        .lines()
-        .filter(|l| RE_PORT_LINE.is_match(l))
-        .collect();
+    let port_lines = port_detail_lines(&output);
     if port_lines.is_empty() {
         report.add("  (no results)").await;
     } else {

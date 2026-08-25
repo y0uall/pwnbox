@@ -9,7 +9,7 @@ use crate::config::ScanConfig;
 use crate::hosts;
 use crate::report::Report;
 use crate::runner;
-use crate::scans::RE_PORT_LINE;
+use crate::scans::port_detail_lines;
 
 // Precompiled once — these run over every nmap TCP result, sometimes repeatedly.
 static RE_RUSTSCAN_PORTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9,]+)\]").unwrap());
@@ -30,14 +30,15 @@ static RE_CERT_SAN: LazyLock<Regex> =
 
 /// Rustscan for fast port discovery, then nmap -sC -sV on the results.
 /// With `resume`, reuses cached nmap output if available.
+/// Raw nmap output goes to `raw_dir` (the output dir's `raw/` subdirectory).
 pub async fn scan(
     ip: &str,
-    output_dir: &Path,
+    raw_dir: &Path,
     report: &Report,
     resume: bool,
     scan_cfg: &ScanConfig,
 ) -> Result<String> {
-    let nmap_path = output_dir.join("nmap-tcp.txt");
+    let nmap_path = raw_dir.join("nmap-tcp.txt");
 
     // check for cached results first
     if resume && nmap_path.exists() {
@@ -48,10 +49,7 @@ pub async fn scan(
             nmap_path.display().to_string().yellow()
         );
         report.section("TCP").await;
-        let port_lines: Vec<&str> = cached
-            .lines()
-            .filter(|l| RE_PORT_LINE.is_match(l))
-            .collect();
+        let port_lines = port_detail_lines(&cached);
         if port_lines.is_empty() {
             report.add("  (no results)").await;
         } else {
@@ -143,12 +141,9 @@ pub async fn scan(
         nmap_path.display().to_string().yellow()
     );
 
-    // add port lines to the text report
+    // add port lines + attached script output to the text report
     report.section("TCP").await;
-    let port_lines: Vec<&str> = nmap_output
-        .lines()
-        .filter(|l| RE_PORT_LINE.is_match(l))
-        .collect();
+    let port_lines = port_detail_lines(&nmap_output);
     if port_lines.is_empty() {
         report.add("  (no results)").await;
     } else {
@@ -161,15 +156,16 @@ pub async fn scan(
 }
 
 /// Run nmap --script vuln on open ports. Caches results for resume.
+/// Raw output goes to `raw_dir` (the output dir's `raw/` subdirectory).
 pub async fn vuln_scan(
     ip: &str,
     ports: &str,
-    output_dir: &Path,
+    raw_dir: &Path,
     report: &Report,
     resume: bool,
     scan_cfg: &ScanConfig,
 ) -> Result<()> {
-    let vuln_path = output_dir.join("nmap-vuln.txt");
+    let vuln_path = raw_dir.join("nmap-vuln.txt");
 
     let output = if resume && vuln_path.exists() {
         let cached = tokio::fs::read_to_string(&vuln_path).await?;
@@ -214,38 +210,7 @@ pub async fn vuln_scan(
 
     report.section("VULN SCAN").await;
 
-    let mut vulns: Vec<String> = Vec::new();
-    let mut in_vuln_block = false;
-    let mut current_vuln = String::new();
-
-    for line in output.lines() {
-        if line.contains("VULNERABLE") {
-            in_vuln_block = true;
-            current_vuln = line.trim().to_string();
-        } else if in_vuln_block {
-            if line.starts_with("|_") {
-                // end of vuln block
-                if !current_vuln.is_empty() {
-                    vulns.push(current_vuln.clone());
-                }
-                in_vuln_block = false;
-                current_vuln.clear();
-            } else if line.starts_with("|") {
-                // continuation, capture CVE IDs
-                if let Some(cap) = RE_VULN.captures(line)
-                    && cap[0].to_ascii_uppercase().starts_with("CVE")
-                {
-                    current_vuln.push_str(&format!(" ({})", &cap[0]));
-                }
-            } else {
-                in_vuln_block = false;
-                if !current_vuln.is_empty() {
-                    vulns.push(current_vuln.clone());
-                }
-                current_vuln.clear();
-            }
-        }
-    }
+    let vulns = parse_vulns(&output);
 
     if vulns.is_empty() {
         println!(
@@ -267,6 +232,68 @@ pub async fn vuln_scan(
     }
 
     Ok(())
+}
+
+/// True for nmap vuln-script verdicts meaning "not affected" — matched
+/// case-insensitively because script authors vary their casing.
+fn is_negative_verdict(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    upper.contains("NOT VULNERABLE") || upper.contains("LIKELY CLEAN")
+}
+
+/// Parse `nmap --script vuln` output into finding lines.
+///
+/// nmap prints a full block even for negative results, and both the block
+/// header ("VULNERABLE:") and its State line contain the keyword — a plain
+/// `contains("VULNERABLE")` therefore false-positives on "State: NOT
+/// VULNERABLE" (REVIEW.md finding 12). A block is dropped when any of its
+/// lines carries a negative verdict.
+fn parse_vulns(output: &str) -> Vec<String> {
+    let mut vulns: Vec<String> = Vec::new();
+    let mut in_vuln_block = false;
+    let mut block_negative = false;
+    let mut current_vuln = String::new();
+
+    for line in output.lines() {
+        if line.contains("VULNERABLE") && !is_negative_verdict(line) {
+            in_vuln_block = true;
+            block_negative = false;
+            // strip the nmap script-output prefix ("|     State: ...") — the
+            // finding text shouldn't carry the raw pipe into the report
+            current_vuln = line.trim_start().trim_start_matches('|').trim().to_string();
+        } else if in_vuln_block {
+            if line.starts_with("|_") {
+                // end of vuln block
+                if !block_negative && !current_vuln.is_empty() {
+                    vulns.push(current_vuln.clone());
+                }
+                in_vuln_block = false;
+                block_negative = false;
+                current_vuln.clear();
+            } else if line.starts_with("|") {
+                if is_negative_verdict(line) {
+                    // e.g. "|     State: NOT VULNERABLE" — the block is a
+                    // negative result, not a finding
+                    block_negative = true;
+                } else if let Some(cap) = RE_VULN.captures(line)
+                    && cap[0].to_ascii_uppercase().starts_with("CVE")
+                {
+                    // continuation, capture CVE IDs
+                    current_vuln.push_str(&format!(" ({})", &cap[0]));
+                }
+            } else {
+                // a non-pipe line ends the block
+                if !block_negative && !current_vuln.is_empty() {
+                    vulns.push(current_vuln.clone());
+                }
+                in_vuln_block = false;
+                block_negative = false;
+                current_vuln.clear();
+            }
+        }
+    }
+
+    vulns
 }
 
 /// Pull hostnames from nmap output: SSL cert CN/SAN, redirects, service info.
@@ -401,39 +428,65 @@ mod tests {
 |     CVE-2017-0144
 |_
 ";
-        let mut vulns: Vec<String> = Vec::new();
-        let mut in_vuln_block = false;
-        let mut current_vuln = String::new();
-
-        for line in output.lines() {
-            if line.contains("VULNERABLE") {
-                in_vuln_block = true;
-                current_vuln = line.trim().to_string();
-            } else if in_vuln_block {
-                if line.starts_with("|_") {
-                    if !current_vuln.is_empty() {
-                        vulns.push(current_vuln.clone());
-                    }
-                    in_vuln_block = false;
-                    current_vuln.clear();
-                } else if line.starts_with("|") {
-                    if let Some(cap) = RE_VULN.captures(line)
-                        && cap[0].to_ascii_uppercase().starts_with("CVE")
-                    {
-                        current_vuln.push_str(&format!(" ({})", &cap[0]));
-                    }
-                } else {
-                    in_vuln_block = false;
-                    if !current_vuln.is_empty() {
-                        vulns.push(current_vuln.clone());
-                    }
-                    current_vuln.clear();
-                }
-            }
-        }
-
+        let vulns = parse_vulns(output);
         assert_eq!(vulns.len(), 1);
         assert!(vulns[0].contains("VULNERABLE"));
+        assert!(vulns[0].contains("CVE-2017-0144"));
+    }
+
+    #[test]
+    fn vuln_findings_drop_the_pipe_prefix() {
+        // findings are reported as "State: VULNERABLE (CVE-...)" — without the
+        // raw nmap script-output prefix
+        let output = "\
+| http-vuln-cve2011-3192:
+|   VULNERABLE:
+|   Apache HTTP Server Range DoS vulnerability
+|     State: VULNERABLE (CVE-2011-3192)
+|_
+";
+        let vulns = parse_vulns(output);
+        assert_eq!(vulns.len(), 1);
+        assert!(!vulns[0].starts_with('|'), "raw pipe leaked: {}", vulns[0]);
+    }
+
+    /// REVIEW.md finding 12: nmap prints full blocks for negative results too —
+    /// "State: NOT VULNERABLE" / "LIKELY CLEAN" must not become findings.
+    #[test]
+    fn vuln_parser_ignores_negative_verdicts() {
+        let output = "\
+| ssl-heartbleed:
+|   VULNERABLE:
+|   The Heartbleed Bug is a serious vulnerability in OpenSSL
+|     State: NOT VULNERABLE
+|_
+|_smb-vuln-ms17-010: target NOT VULNERABLE
+| tls-poodle:
+|   VULNERABLE:
+|   SSL POODLE information leak
+|     State: Likely clean
+|_
+";
+        assert!(parse_vulns(output).is_empty());
+    }
+
+    #[test]
+    fn vuln_parser_keeps_positive_block_next_to_negative_one() {
+        let output = "\
+| smb-vuln-ms17-010:
+|   VULNERABLE:
+|   Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)
+|     State: VULNERABLE
+|     CVE-2017-0144
+|_
+| ssl-heartbleed:
+|   VULNERABLE:
+|   The Heartbleed Bug
+|     State: NOT VULNERABLE
+|_
+";
+        let vulns = parse_vulns(output);
+        assert_eq!(vulns.len(), 1);
         assert!(vulns[0].contains("CVE-2017-0144"));
     }
 }

@@ -80,6 +80,10 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
 
         let port_str = port.to_string();
         for (user, pass) in &default_creds {
+            // Deliberately serial (no racing like mysql/postgres/redis/snmp):
+            // parallel SA logins risk tripping the account lockout policy
+            // (REVIEW.md finding 9); the per-attempt timeout is lowered to 10s
+            // to bound the serial worst case instead.
             // build the arg vector directly — no shell, no quoting games
             let target = if pass.is_empty() {
                 format!("{user}@{ip}")
@@ -94,7 +98,7 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
             }
             args.extend_from_slice(&["-q", "SELECT @@version"]);
 
-            let (login_ok, result) = runner::run_cmd_status(mssql_client, &args, 15).await?;
+            let (login_ok, result) = runner::run_cmd_status(mssql_client, &args, 10).await?;
 
             if !login_ok {
                 if is_expected_login_denial(&result) {

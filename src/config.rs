@@ -155,7 +155,10 @@ impl WordlistsConfig {
             ];
         }
         if self.usernames.is_empty() {
+            // names.txt (~10k entries) first: it finishes within the kerbrute
+            // timeout, the 8.3M-entry xato list structurally cannot
             self.usernames = vec![
+                "/opt/SecLists/Usernames/Names/names.txt".into(),
                 "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt".into(),
                 "/opt/SecLists/Usernames/top-usernames-shortlist.txt".into(),
             ];

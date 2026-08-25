@@ -28,8 +28,10 @@ dns_subdomains = [
     "/usr/share/dnsrecon/subdomains-top1mil-5000.txt",
 ]
 
-# Username wordlists
+# Username wordlists (first existing file wins — names.txt finishes inside
+# the 10-minute kerbrute timeout; the 8.3M-entry xato list cannot)
 usernames = [
+    "/opt/SecLists/Usernames/Names/names.txt",
     "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt",
     "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
 ]

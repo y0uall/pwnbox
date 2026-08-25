@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
-use std::time::Instant;
+use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
 use clap::builder::styling::{AnsiColor, Style, Styles};
 use colored::Colorize;
 use regex::Regex;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use unicode_width::UnicodeWidthStr;
 
 // precompile these so we don't re-create them on every call
@@ -18,9 +19,11 @@ static RE_OPEN_PORT: LazyLock<Regex> =
 // version-less port line would let \s eat the newline and (.*) swallow the next
 // port line (in the regex crate \s matches \n).
 // Distinct from the scanners' `RE_PORT_LINE` prefix filter: this one captures the
-// port, proto, service and version fields for pretty-printing / JSON extraction.
+// port, proto, state, service and version fields for pretty-printing / JSON
+// extraction. The state is captured verbatim so UDP's "open|filtered" reaches
+// the JSON report instead of being flattened to "open" (REVIEW.md "Niedrig").
 static RE_PORT_DETAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^(\d+)/(tcp|udp)[ \t]+open(?:\|filtered)?[ \t]+(\S+)[ \t]*([^\n]*)").unwrap()
+    Regex::new(r"(?m)^(\d+)/(tcp|udp)[ \t]+(open(?:\|filtered)?)[ \t]+(\S+)[ \t]*([^\n]*)").unwrap()
 });
 static RE_TCP_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+/tcp").unwrap());
 static RE_UDP_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+/udp").unwrap());
@@ -312,8 +315,8 @@ fn has_port(ports: &HashSet<(u16, String)>, port: u16, proto: &str) -> bool {
 fn port_service_map(output: &str, proto: &str) -> HashMap<u16, String> {
     parse_port_entries(output)
         .into_iter()
-        .filter(|(_, p, _, _)| p == proto)
-        .map(|(port, _, service, _)| (port, service))
+        .filter(|(_, p, _, _, _)| p == proto)
+        .map(|(port, _, _, service, _)| (port, service))
         .collect()
 }
 
@@ -593,8 +596,10 @@ fn print_report_banner(name: &str, ip: &str) {
     println!("{}", banner_bottom());
 }
 
-/// Extract structured port info from nmap output for JSON report.
-fn parse_port_entries(output: &str) -> Vec<(u16, String, String, String)> {
+/// Extract structured port info from nmap output for the JSON report.
+/// Returns (port, proto, state, service, version) — state keeps UDP's
+/// "open|filtered" verbatim.
+fn parse_port_entries(output: &str) -> Vec<(u16, String, String, String, String)> {
     let mut entries = Vec::new();
     for cap in RE_PORT_DETAIL.captures_iter(output) {
         if let Ok(port) = cap[1].parse::<u16>() {
@@ -603,11 +608,52 @@ fn parse_port_entries(output: &str) -> Vec<(u16, String, String, String)> {
                 cap[2].to_string(),
                 cap[3].to_string(),
                 cap[4].to_string(),
+                cap[5].to_string(),
             ));
         }
     }
     entries
 }
+
+/// Abort handles for every background task the pipeline spawns (vuln scan, UDP
+/// scan, service scans, web brute-forces). The signal path aborts them all so
+/// their child processes are actually killed: `kill_on_drop` (runner.rs) only
+/// fires when a task's future is dropped, and a bare `process::exit` would
+/// never drop anything — orphaned nmap/feroxbuster children were the result
+/// (REVIEW.md finding 3).
+///
+/// A std Mutex is enough here: the lock is only ever held for a push/iteration,
+/// never across an `.await`.
+#[derive(Clone, Default)]
+struct TaskRegistry(Arc<Mutex<Vec<AbortHandle>>>);
+
+impl TaskRegistry {
+    /// Spawn a task and register its abort handle in one step.
+    fn spawn<F>(&self, fut: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        self.track(&handle);
+        handle
+    }
+
+    /// Register a task that was spawned elsewhere (e.g. inside web::enumerate).
+    fn track<T>(&self, handle: &JoinHandle<T>) {
+        self.0.lock().unwrap().push(handle.abort_handle());
+    }
+
+    /// Abort every registered task; a no-op for tasks that already finished.
+    fn abort_all(&self) {
+        for handle in self.0.lock().unwrap().iter() {
+            handle.abort();
+        }
+    }
+}
+
+/// LDAP task result: the task's isolated report plus the discovered domain.
+type LdapTask = JoinHandle<Result<(Report, Option<String>)>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -664,8 +710,10 @@ async fn main() -> Result<()> {
     runner::set_default_timeout(scan_cfg.timeout);
     runner::set_verbose(scan_cfg.verbose);
 
-    // make sure output dir exists
+    // make sure output dir exists — plus raw/, which keeps the noisy tool
+    // output (nmap/ferox/vhost files) away from the final report(s)
     tokio::fs::create_dir_all(&cfg.output_dir).await?;
+    tokio::fs::create_dir_all(cfg.output_dir.join("raw")).await?;
 
     // show the start banner
     print_start_banner(
@@ -680,7 +728,7 @@ async fn main() -> Result<()> {
     // Check only tools needed by the resolved scan plan, including overrides.
     tools::check_all(&scan_cfg).await?;
 
-    // Prepare report clones for the signal handler so an interrupt can flush a
+    // Prepare report clones for the interrupt path so a Ctrl+C can flush a
     // partial report even while the pipeline is still running.
     let report_for_signal = report.clone();
     let report_path = cfg.report_path.clone();
@@ -690,8 +738,19 @@ async fn main() -> Result<()> {
         None
     };
 
-    let scan = run_scan(cli, cfg, scan_cfg, report);
-    let signal = async move {
+    // Handles for the failure path: even when run_scan bails out with an error,
+    // main must still flush whatever the report holds (REVIEW.md finding 1).
+    let report_for_error = report.clone();
+    let report_path_for_error = cfg.report_path.clone();
+    let json_for_error = cli.json;
+
+    // Abort handles for every background task the pipeline spawns, so the
+    // interrupt path can stop them (and, via kill_on_drop, their child
+    // processes) before exiting.
+    let tasks = TaskRegistry::default();
+
+    let scan = run_scan(cli, cfg, scan_cfg, report, tasks.clone());
+    let signal = async {
         let ctrl_c = tokio::signal::ctrl_c();
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -700,24 +759,79 @@ async fn main() -> Result<()> {
             _ = ctrl_c => {},
             _ = terminate.recv() => {},
         }
-        println!(
-            "\n{} Interrupted — writing partial report...",
-            "[!]".yellow()
-        );
-        if let Err(e) = report_for_signal.write_partial(&report_path).await {
-            eprintln!("Failed to write partial report: {e}");
-        }
-        if let Some(jp) = json_path
-            && let Err(e) = report_for_signal.write_json(&jp).await
-        {
-            eprintln!("Failed to write partial JSON report: {e}");
-        }
-        std::process::exit(130);
     };
 
     tokio::select! {
-        res = scan => res,
-        _ = signal => Ok(()),
+        res = scan => {
+            if let Err(e) = &res {
+                // The pipeline aborted before run_scan could write its report —
+                // flush the partial findings instead of losing them.
+                eprintln!(
+                    "{} Scan failed: {e} — writing partial report...",
+                    "[-]".red().bold()
+                );
+                finalize_report(&report_for_error, &report_path_for_error, json_for_error).await;
+            }
+            return res;
+        }
+        // Losing the select! drops `scan`, which kills the *foreground* child
+        // process via kill_on_drop; the shutdown below handles the background
+        // tasks and the partial report.
+        _ = signal => {}
+    }
+
+    // ── graceful shutdown on SIGINT/SIGTERM (REVIEW.md finding 3) ──
+    println!(
+        "\n{} Interrupted — aborting background tasks...",
+        "[!]".yellow()
+    );
+    tasks.abort_all();
+    // Give runtime worker threads a moment to drop the aborted tasks' futures:
+    // only when those drops run does kill_on_drop fire for their children
+    // (nmap, feroxbuster, ffuf, ...). exit(130) must come AFTER this cleanup
+    // because process::exit runs no destructors — exiting immediately would
+    // leave the still-running children behind as (partly root-owned) orphans.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    println!("{} Writing partial report...", "[!]".yellow());
+    if let Err(e) = report_for_signal.write_partial(&report_path).await {
+        eprintln!("Failed to write partial report: {e}");
+    }
+    if let Some(jp) = json_path
+        && let Err(e) = report_for_signal.write_json(&jp).await
+    {
+        eprintln!("Failed to write partial JSON report: {e}");
+    }
+    std::process::exit(130);
+}
+
+/// Last-ditch report flush for the error path: writes the text report (plus the
+/// JSON report when `--json` was given). Write failures are logged, not
+/// propagated — the original scan error is what `main` returns.
+async fn finalize_report(report: &Report, report_path: &Path, json: bool) {
+    if let Err(e) = report.write_to_file(report_path).await {
+        eprintln!("{} Failed to write report: {e}", "[-]".red().bold());
+    }
+    if json {
+        let json_path = report_path.with_extension("json");
+        if let Err(e) = report.write_json(&json_path).await {
+            eprintln!("{} Failed to write JSON report: {e}", "[-]".red().bold());
+        }
+    }
+}
+
+/// Persist watch-mode findings (port changes, rescan errors) right after they
+/// happen. The watch loop never returns, so without this rewrite the events
+/// would stay memory-only until Ctrl+C — and the interrupt flush is not
+/// guaranteed to run before exit (REVIEW.md "Niedrig"). Best-effort: a failed
+/// rewrite must not kill the watch loop.
+async fn persist_watch_report(report: &Report, report_path: &Path, json_path: Option<&Path>) {
+    if let Err(e) = report.write_to_file(report_path).await {
+        println!("{} Could not update report file: {e}", "[!]".yellow());
+    }
+    if let Some(p) = json_path
+        && let Err(e) = report.write_json(p).await
+    {
+        println!("{} Could not update JSON report: {e}", "[!]".yellow());
     }
 }
 
@@ -725,9 +839,23 @@ async fn main() -> Result<()> {
 ///
 /// This runs inside `tokio::select!` in `main` alongside a signal handler, so it
 /// can be cancelled at any point; the shared `Report` is then flushed by the
-/// signal handler.
-async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report) -> Result<()> {
+/// interrupt path. Core-phase failures (TCP scan, web enumerate) are recorded via
+/// `report.add_error` and degraded to empty output instead of aborting; any error
+/// that still escapes is flushed by `finalize_report` in `main`.
+///
+/// Every background task is spawned through `registry` so the signal path can
+/// abort them all before exiting (their child processes die via kill_on_drop).
+async fn run_scan(
+    cli: Cli,
+    cfg: BoxConfig,
+    scan_cfg: ScanConfig,
+    report: Report,
+    registry: TaskRegistry,
+) -> Result<()> {
     let start = Instant::now();
+    // raw tool output (nmap/ferox/vhost files) — created in `main`, used by
+    // every scan module below
+    let raw_dir = cfg.output_dir.join("raw");
 
     // start building the report
     report
@@ -753,10 +881,12 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         };
     }
 
-    // warm up sudo so we don't get prompted mid-scan
+    // warm up sudo so we don't get prompted mid-scan — interactive stdio, so a
+    // password prompt actually reaches the terminal instead of hanging unseen
+    // on a piped stderr until the timeout (REVIEW.md finding 6)
     if !runner::has_sudo().await {
         println!("{} sudo required (for /etc/hosts & UDP scan)", "[*]".cyan());
-        let _ = runner::run_cmd("sudo", &["-v"]).await;
+        let _ = runner::run_cmd_interactive("sudo", &["-v"]).await;
     }
 
     // --- Phase 0: ping check + OS guess from TTL ---
@@ -797,8 +927,17 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     // --- Phase 2: TCP port discovery ---
     let t = Instant::now();
     phase_header("[2/6]", "TCP port discovery...");
+    // TCP is a core phase, but a failure here must not kill the whole report —
+    // record the error and continue with empty port data, same as DNS above.
     let nmap_output =
-        scans::tcp::scan(&cfg.ip, &cfg.output_dir, &report, cli.resume, &scan_cfg).await?;
+        match scans::tcp::scan(&cfg.ip, &raw_dir, &report, cli.resume, &scan_cfg).await {
+            Ok(output) => output,
+            Err(e) => {
+                println!("{} TCP scan failed: {e}", "[!]".yellow());
+                report.add_error("TCP", &e.to_string()).await;
+                String::new()
+            }
+        };
 
     // pull hostnames from nmap output (SSL certs, redirects, etc.) — best-effort
     let nmap_hosts = match scans::tcp::extract_hostnames(&nmap_output, &cfg.ip).await {
@@ -819,17 +958,15 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     let tcp_services = port_service_map(&nmap_output, "tcp");
 
     // grab hostnames from SSL certs on HTTPS ports — a port counts as SSL if it's
-    // a well-known TLS port or *its own* nmap line mentions ssl (checked per-port,
-    // not globally across the whole output)
+    // a well-known TLS port or its own nmap service name mentions ssl. The
+    // service names were already captured into tcp_services above, so this stays
+    // a single pass over the nmap output (REVIEW.md "Niedrig").
     let ssl_ports: Vec<u16> = tcp_ports
         .iter()
         .filter(|(_, proto)| proto == "tcp")
         .map(|(p, _)| *p)
         .filter(|p| {
-            [443, 8443].contains(p)
-                || nmap_output
-                    .lines()
-                    .any(|l| l.starts_with(&format!("{p}/tcp")) && l.contains("ssl"))
+            [443, 8443].contains(p) || tcp_services.get(p).is_some_and(|svc| svc.contains("ssl"))
         })
         .collect();
     if !ssl_ports.is_empty() {
@@ -855,9 +992,9 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     }
 
     // fill JSON report with port data
-    for (port, proto, service, version) in parse_port_entries(&nmap_output) {
+    for (port, proto, state, service, version) in parse_port_entries(&nmap_output) {
         report
-            .add_port(port, &proto, "open", &service, &version)
+            .add_port(port, &proto, &state, &service, &version)
             .await;
     }
 
@@ -873,9 +1010,9 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
                 .collect::<Vec<_>>()
                 .join(",");
             let vuln_ip = cfg.ip.clone();
-            let vuln_dir = cfg.output_dir.clone();
+            let vuln_dir = raw_dir.clone();
             let vuln_cfg = scan_cfg.clone();
-            Some(tokio::spawn(async move {
+            Some(registry.spawn(async move {
                 // write into an isolated report, merged back after join so this
                 // section can't interleave with other concurrent writers
                 let tr = Report::new();
@@ -893,16 +1030,21 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         if !scan_cfg.should_skip("web") {
             let t = Instant::now();
             phase_header("[4/6]", "Web (fast: headers only)...");
-            scans::web::enumerate(
+            // web::enumerate respects scan_cfg.fast internally; a failure is
+            // best-effort here too — record it and still write the report below
+            if let Err(e) = scans::web::enumerate(
                 &cfg.ip,
                 &cfg.hostname,
                 &nmap_output,
-                &cfg.output_dir,
+                &raw_dir,
                 &report,
                 &scan_cfg,
             )
-            .await?;
-            // web::enumerate respects scan_cfg.fast internally
+            .await
+            {
+                println!("{} Web enumeration failed: {e}", "[!]".yellow());
+                report.add_error("WEB", &e.to_string()).await;
+            }
             phase_done(t);
         }
 
@@ -944,9 +1086,9 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     let udp_handle: Option<JoinHandle<Result<(String, Report)>>> = if !scan_cfg.should_skip("udp") {
         phase_header("[3/6]", "UDP scan (background)...");
         let udp_ip = cfg.ip.clone();
-        let udp_dir = cfg.output_dir.clone();
+        let udp_dir = raw_dir.clone();
         let udp_cfg = scan_cfg.clone();
-        Some(tokio::spawn(async move {
+        Some(registry.spawn(async move {
             // isolated report, merged back after join
             let tr = Report::new();
             let out = scans::udp::scan(&udp_ip, &udp_dir, &tr, resume, &udp_cfg).await?;
@@ -961,15 +1103,30 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     let web_bg_tasks = if !scan_cfg.should_skip("web") {
         let t = Instant::now();
         phase_header("[4/6]", "Web enumeration...");
-        let tasks = scans::web::enumerate(
+        let tasks = match scans::web::enumerate(
             &cfg.ip,
             &cfg.hostname,
             &nmap_output,
-            &cfg.output_dir,
+            &raw_dir,
             &report,
             &scan_cfg,
         )
-        .await?;
+        .await
+        {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                // best-effort like the other phases: record the failure and
+                // continue with no background tasks instead of aborting the scan
+                println!("{} Web enumeration failed: {e}", "[!]".yellow());
+                report.add_error("WEB", &e.to_string()).await;
+                Vec::new()
+            }
+        };
+        // feroxbuster/vhost scans are spawned inside web::enumerate — register
+        // their abort handles so the signal path can still stop them
+        for task in &tasks {
+            registry.track(task);
+        }
         phase_done(t);
         tasks
     } else {
@@ -989,32 +1146,34 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     // Services without a configurable port are triggered by nmap service name
     // *or* by their well-known fallback port.
 
-    // SSH
-    if !detect_service_ports(&tcp_services, &["ssh"], &[22], &tcp_ports).is_empty()
-        && !scan_cfg.should_skip("ssh")
-    {
+    // SSH — port-aware
+    for ssh_port in detect_service_ports(&tcp_services, &["ssh"], &[22], &tcp_ports) {
+        if scan_cfg.should_skip("ssh") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
             "SSH",
-            tokio::spawn(async move {
-                scans::ssh::check(&ip, &r).await?;
+            registry.spawn(async move {
+                scans::ssh::check(&ip, ssh_port, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
-    // FTP
-    if !detect_service_ports(&tcp_services, &["ftp"], &[21], &tcp_ports).is_empty()
-        && !scan_cfg.should_skip("ftp")
-    {
+    // FTP — port-aware
+    for ftp_port in detect_service_ports(&tcp_services, &["ftp"], &[21], &tcp_ports) {
+        if scan_cfg.should_skip("ftp") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
         svc_handles.push((
             "FTP",
-            tokio::spawn(async move {
-                scans::ftp::check_anonymous(&ip, &sc, &r).await?;
+            registry.spawn(async move {
+                scans::ftp::check_anonymous(&ip, ftp_port, &sc, &r).await?;
                 Ok(r)
             }),
         ));
@@ -1029,7 +1188,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "SMB",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::smb::enumerate(&ip, &sc, &r).await?;
                 Ok(r)
             }),
@@ -1045,7 +1204,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "RPC",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::rpc::enumerate(&ip, &sc, &r).await?;
                 Ok(r)
             }),
@@ -1062,7 +1221,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "NFS",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::nfs::enumerate(&ip, &sc, &r).await?;
                 Ok(r)
             }),
@@ -1078,7 +1237,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let ip = cfg.ip.clone();
         svc_handles.push((
             "MySQL",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::mysql::check(&ip, mysql_port, &r).await?;
                 Ok(r)
             }),
@@ -1099,23 +1258,24 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let ip = cfg.ip.clone();
         svc_handles.push((
             "PostgreSQL",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::postgres::check(&ip, postgres_port, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
-    // Redis
-    if !detect_service_ports(&tcp_services, &["redis"], &[6379], &tcp_ports).is_empty()
-        && !scan_cfg.should_skip("redis")
-    {
+    // Redis — port-aware
+    for redis_port in detect_service_ports(&tcp_services, &["redis"], &[6379], &tcp_ports) {
+        if scan_cfg.should_skip("redis") {
+            break;
+        }
         let r = Report::new();
         let ip = cfg.ip.clone();
         svc_handles.push((
             "Redis",
-            tokio::spawn(async move {
-                scans::redis::check(&ip, &r).await?;
+            registry.spawn(async move {
+                scans::redis::check(&ip, redis_port, &r).await?;
                 Ok(r)
             }),
         ));
@@ -1137,7 +1297,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "WinRM",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::winrm::check(&ip, winrm_port, &sc, &r).await?;
                 Ok(r)
             }),
@@ -1156,7 +1316,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "MSSQL",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::mssql::check(&ip, mssql_port, &sc, &r).await?;
                 Ok(r)
             }),
@@ -1179,31 +1339,81 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         let sc = scan_cfg.clone();
         svc_handles.push((
             "SMTP",
-            tokio::spawn(async move {
+            registry.spawn(async move {
                 scans::smtp::check(&ip, smtp_port, &sc, &r).await?;
                 Ok(r)
             }),
         ));
     }
 
-    // LDAP runs first (not in parallel) because Kerberos needs the domain
-    let mut ldap_domain: Option<String> = None;
-    if let Some(ldap_port) =
+    // LDAP runs as its own task now (isolated report, merged after the join).
+    // Kerberos only needs the domain string from it, so it can start as soon
+    // as LDAP joins instead of waiting for the UDP scan (REVIEW.md finding 11).
+    let ldap_handle: Option<LdapTask> = if let Some(ldap_port) =
         detect_service_ports(&tcp_services, &["ldap", "ldaps"], &[389, 636], &tcp_ports)
             .first()
             .copied()
         && !scan_cfg.should_skip("ldap")
     {
         println!("{} LDAP enumeration on port {ldap_port}...", "[*]".cyan());
-        ldap_domain = match scans::ldap::enumerate(&cfg.ip, ldap_port, &scan_cfg, &report).await {
-            Ok(domain) => domain,
-            Err(e) => {
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let sc = scan_cfg.clone();
+        Some(registry.spawn(async move {
+            let domain = scans::ldap::enumerate(&ip, ldap_port, &sc, &r).await?;
+            Ok((r, domain))
+        }))
+    } else {
+        None
+    };
+
+    // join LDAP right away (the service tasks above keep running meanwhile)
+    // and start Kerberos immediately, so it overlaps with phase 5 + UDP
+    let mut ldap_domain: Option<String> = None;
+    if let Some(handle) = ldap_handle {
+        match handle.await {
+            Ok(Ok((tr, domain))) => {
+                report.merge_from(&tr).await;
+                println!("{} LDAP done", "[+]".green());
+                ldap_domain = domain;
+            }
+            Ok(Err(e)) => {
                 println!("{} LDAP enumeration failed: {e}", "[!]".yellow());
                 report.add_error("LDAP", &e.to_string()).await;
-                None
             }
-        };
+            Err(e) => {
+                println!("{} LDAP task panicked: {e}", "[!]".yellow());
+                report
+                    .add_error("LDAP", &format!("task panicked: {e}"))
+                    .await;
+            }
+        }
     }
+
+    // kerberos uses the domain we found from LDAP (if any) — spawned now and
+    // collected together with the UDP handle below
+    let kerb_handle: Option<JoinHandle<Result<Report>>> = if !detect_service_ports(
+        &tcp_services,
+        &["kerberos-sec", "kerberos"],
+        &[88],
+        &tcp_ports,
+    )
+    .is_empty()
+        && !scan_cfg.should_skip("kerberos")
+    {
+        println!("{} Kerberos enumeration...", "[*]".cyan());
+        let r = Report::new();
+        let ip = cfg.ip.clone();
+        let hostname = cfg.hostname.clone();
+        let domain = ldap_domain.clone();
+        let sc = scan_cfg.clone();
+        Some(registry.spawn(async move {
+            scans::kerberos::enumerate(&ip, &hostname, domain.as_deref(), &sc, &r).await?;
+            Ok(r)
+        }))
+    } else {
+        None
+    };
 
     // collect results from parallel service scans, merging each task's report
     for (name, handle) in svc_handles {
@@ -1224,38 +1434,54 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
     }
     phase_done(t);
 
-    // wait for the UDP scan to finish
-    let udp_output = if let Some(handle) = udp_handle {
+    // wait for the UDP scan and the Kerberos task in parallel — Kerberos was
+    // spawned right after the LDAP join and doesn't depend on UDP results
+    // (REVIEW.md finding 11)
+    if udp_handle.is_some() {
         println!("\n{} Waiting for UDP scan...", "[*]".yellow());
-        match handle.await {
-            Ok(Ok((output, tr))) => {
-                report.merge_from(&tr).await;
-                println!("{} UDP scan complete", "[+]".green());
-                for (port, proto, service, version) in parse_port_entries(&output) {
-                    report
-                        .add_port(port, &proto, "open", &service, &version)
-                        .await;
-                }
-                output
+    }
+    let (udp_join, kerb_join) = tokio::join!(
+        async move {
+            match udp_handle {
+                Some(h) => Some(h.await),
+                None => None,
             }
-            Ok(Err(e)) => {
-                println!("{} UDP scan failed: {e}", "[!]".yellow());
-                report.add_error("UDP", &e.to_string()).await;
-                String::new()
+        },
+        async move {
+            match kerb_handle {
+                Some(h) => Some(h.await),
+                None => None,
             }
-            Err(e) => {
-                println!("{} UDP scan panicked: {e}", "[!]".yellow());
+        },
+    );
+
+    let udp_output = match udp_join {
+        Some(Ok(Ok((output, tr)))) => {
+            report.merge_from(&tr).await;
+            println!("{} UDP scan complete", "[+]".green());
+            for (port, proto, state, service, version) in parse_port_entries(&output) {
                 report
-                    .add_error("UDP", &format!("task panicked: {e}"))
+                    .add_port(port, &proto, &state, &service, &version)
                     .await;
-                String::new()
             }
+            output
         }
-    } else {
-        String::new()
+        Some(Ok(Err(e))) => {
+            println!("{} UDP scan failed: {e}", "[!]".yellow());
+            report.add_error("UDP", &e.to_string()).await;
+            String::new()
+        }
+        Some(Err(e)) => {
+            println!("{} UDP scan panicked: {e}", "[!]".yellow());
+            report
+                .add_error("UDP", &format!("task panicked: {e}"))
+                .await;
+            String::new()
+        }
+        None => String::new(),
     };
 
-    // SNMP/Kerberos depend on UDP results, so they run after
+    // SNMP depends on UDP results, so it runs after
     let udp_ports = parse_open_ports(&udp_output);
 
     if has_port(&udp_ports, 161, "udp") && !scan_cfg.should_skip("snmp") {
@@ -1266,28 +1492,24 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
         }
     }
 
-    // kerberos uses the domain we found from LDAP (if any)
-    if !detect_service_ports(
-        &tcp_services,
-        &["kerberos-sec", "kerberos"],
-        &[88],
-        &tcp_ports,
-    )
-    .is_empty()
-        && !scan_cfg.should_skip("kerberos")
-    {
-        println!("\n{} Kerberos enumeration...", "[*]".cyan());
-        if let Err(e) = scans::kerberos::enumerate(
-            &cfg.ip,
-            &cfg.hostname,
-            ldap_domain.as_deref(),
-            &scan_cfg,
-            &report,
-        )
-        .await
-        {
-            println!("{} Kerberos enumeration failed: {e}", "[!]".yellow());
-            report.add_error("KERBEROS", &e.to_string()).await;
+    // merge the Kerberos task's report — kept after SNMP so the report's
+    // section order matches the previous serial version
+    if let Some(join) = kerb_join {
+        match join {
+            Ok(Ok(tr)) => {
+                report.merge_from(&tr).await;
+                println!("{} KERBEROS done", "[+]".green());
+            }
+            Ok(Err(e)) => {
+                println!("{} Kerberos enumeration failed: {e}", "[!]".yellow());
+                report.add_error("KERBEROS", &e.to_string()).await;
+            }
+            Err(e) => {
+                println!("{} Kerberos task panicked: {e}", "[!]".yellow());
+                report
+                    .add_error("KERBEROS", &format!("task panicked: {e}"))
+                    .await;
+            }
         }
     }
 
@@ -1386,7 +1608,9 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
             interval
         );
         let watch_nmap = scan_cfg.tool("nmap");
-        let watch_timeout = runner::default_timeout().max(300);
+        // same floor as the initial full `-p-` scan (900s): on slow links a
+        // 300s rescan times out structurally (REVIEW.md "Niedrig")
+        let watch_timeout = runner::default_timeout().max(900);
         // The initial scan may have used a narrower scope (rustscan top ports) than
         // the full `-p-` rescan below, so the first watch scan establishes the
         // baseline instead of diffing against it — otherwise every port only the
@@ -1413,6 +1637,7 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
                         "[watch]".yellow()
                     );
                     report.add_error("WATCH", &e.to_string()).await;
+                    persist_watch_report(&report, &cfg.report_path, json_path.as_deref()).await;
                     continue;
                 }
             };
@@ -1430,33 +1655,46 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
                 Some(prev) => {
                     let appeared: Vec<_> = new_ports.difference(prev).collect();
                     let disappeared: Vec<_> = prev.difference(&new_ports).collect();
+                    let fmt_ports = |ports: &[&(u16, String)]| {
+                        ports
+                            .iter()
+                            .map(|(p, proto)| format!("{p}/{proto}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
 
                     if !appeared.is_empty() {
                         println!(
                             "{} NEW PORTS: {}",
                             "[!!]".red().bold(),
-                            appeared
-                                .iter()
-                                .map(|(p, proto)| format!("{p}/{proto}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                                .red()
+                            fmt_ports(&appeared).red()
                         );
                     }
                     if !disappeared.is_empty() {
                         println!(
                             "{} CLOSED PORTS: {}",
                             "[--]".yellow(),
-                            disappeared
-                                .iter()
-                                .map(|(p, proto)| format!("{p}/{proto}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                                .yellow()
+                            fmt_ports(&disappeared).yellow()
                         );
                     }
                     if appeared.is_empty() && disappeared.is_empty() {
                         println!("{} No port changes detected", "[ok]".green());
+                    } else {
+                        // record the change in the report too, then rewrite it —
+                        // the watch loop never reaches the final report write
+                        // itself (REVIEW.md "Niedrig")
+                        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                        for (label, ports) in
+                            [("NEW PORTS", &appeared), ("CLOSED PORTS", &disappeared)]
+                        {
+                            if ports.is_empty() {
+                                continue;
+                            }
+                            let line = format!("[{stamp}] {label}: {}", fmt_ports(ports));
+                            report.add(&format!("[watch] {line}")).await;
+                            report.add_service_finding("watch", &line).await;
+                        }
+                        persist_watch_report(&report, &cfg.report_path, json_path.as_deref()).await;
                     }
                 }
             }
@@ -1468,13 +1706,29 @@ async fn run_scan(cli: Cli, cfg: BoxConfig, scan_cfg: ScanConfig, report: Report
 }
 
 // Feroxbuster result lines start with an HTTP status code, e.g. "200      GET".
-static RE_FEROX_RESULT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{3}\s+\w+").unwrap());
+// pub(crate): scans/web.rs uses the same pattern to decide whether a killed
+// feroxbuster left usable partial results behind.
+pub(crate) static RE_FEROX_RESULT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{3}\s+\w+").unwrap());
+
+/// Color a feroxbuster hit by its HTTP status class: 2xx green, 3xx cyan,
+/// 4xx yellow, 5xx red — the line starts with the status code.
+fn colorize_ferox_line(line: &str) -> String {
+    match line.chars().next() {
+        Some('2') => line.green().to_string(),
+        Some('3') => line.cyan().to_string(),
+        Some('4') => line.yellow().to_string(),
+        Some('5') => line.red().to_string(),
+        _ => line.to_string(),
+    }
+}
 
 /// Clean up feroxbuster output: strip config noise, keep actual findings.
+/// The raw files live in the output dir's `raw/` subdirectory.
 async fn process_ferox_results(cfg: &BoxConfig, report: &Report) {
     let mut found_any = false;
 
-    let mut entries = match tokio::fs::read_dir(&cfg.output_dir).await {
+    let mut entries = match tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
         Ok(e) => e,
         Err(e) => {
             report.add_error("DIR BRUTE", &e.to_string()).await;
@@ -1529,6 +1783,18 @@ async fn process_ferox_results(cfg: &BoxConfig, report: &Report) {
             path.display().to_string().yellow(),
             results.len()
         );
+        // show the hits right away, color-coded by status class — capped so a
+        // big wordlist can't flood the terminal; the report has everything
+        const MAX_PRINTED: usize = 25;
+        for line in results.iter().take(MAX_PRINTED) {
+            println!("    {}", colorize_ferox_line(line));
+        }
+        if results.len() > MAX_PRINTED {
+            println!(
+                "    … and {} more in the report",
+                results.len() - MAX_PRINTED
+            );
+        }
         report.add(&format!("  -> {}", path.display())).await;
         for line in &results {
             report.add(line).await;
@@ -1564,10 +1830,11 @@ fn normalize_vhost_candidate(candidate: &str, base_domain: &str) -> Option<Strin
 }
 
 /// Parse vhost scan results (ffuf CSV or gobuster format) and add to /etc/hosts.
+/// The raw files live in the output dir's `raw/` subdirectory.
 async fn process_vhost_results(cfg: &BoxConfig, report: &Report) {
     let mut found_any = false;
 
-    let mut entries = match tokio::fs::read_dir(&cfg.output_dir).await {
+    let mut entries = match tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
         Ok(e) => e,
         Err(e) => {
             report.add_error("VHOSTS", &e.to_string()).await;
@@ -1696,7 +1963,7 @@ async fn print_summary(
         "Report".dimmed(),
         cfg.report_path.display().to_string().yellow()
     );
-    let nmap_tcp = cfg.output_dir.join("nmap-tcp.txt");
+    let nmap_tcp = cfg.output_dir.join("raw").join("nmap-tcp.txt");
     if nmap_tcp.exists() {
         println!(
             "  {} {}",
@@ -1704,7 +1971,7 @@ async fn print_summary(
             nmap_tcp.display().to_string().yellow()
         );
     }
-    let nmap_udp = cfg.output_dir.join("nmap-udp.txt");
+    let nmap_udp = cfg.output_dir.join("raw").join("nmap-udp.txt");
     if nmap_udp.exists() {
         println!(
             "  {} {}",
@@ -1712,7 +1979,7 @@ async fn print_summary(
             nmap_udp.display().to_string().yellow()
         );
     }
-    if let Ok(mut entries) = tokio::fs::read_dir(&cfg.output_dir).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -1735,6 +2002,7 @@ async fn print_summary(
     // suggest next steps based on which ports are open
     let mut next_steps: Vec<String> = Vec::new();
     let all_ports = extract_open_ports(nmap_output, udp_output);
+    let http_ports = scans::web::detect_http_ports(nmap_output);
     for port in &all_ports {
         let step = match *port {
             21 => Some("FTP(21): check anonymous login, upload/download files"),
@@ -1766,11 +2034,23 @@ async fn print_summary(
             27017 => Some("MongoDB(27017): mongosh --host, check no-auth"),
             _ => None,
         };
-        if let Some(s) = step {
-            let text = s.to_string();
-            if !next_steps.contains(&text) {
-                next_steps.push(text);
-            }
+        // HTTP ports on non-standard ports (e.g. fingerprint-detected 6274)
+        // aren't in the table above — give them the generic web hint too
+        let step = step.map(str::to_string).or_else(|| {
+            http_ports
+                .iter()
+                .find(|(p, _)| p == port)
+                .map(|(_, scheme)| {
+                    format!(
+                        "{}({port}): check source, robots.txt, tech stack, dir brute deeper",
+                        scheme.to_uppercase()
+                    )
+                })
+        });
+        if let Some(text) = step
+            && !next_steps.contains(&text)
+        {
+            next_steps.push(text);
         }
     }
 
@@ -1873,17 +2153,18 @@ PORT     STATE         SERVICE
 
     #[test]
     fn test_parse_port_entries_udp_open_filtered() {
-        // both "open|filtered" and plain "open" udp ports must reach the report
+        // both "open|filtered" and plain "open" udp ports must reach the report,
+        // with their real state (not flattened to "open")
         let entries = parse_port_entries(NMAP_UDP_FILTERED);
         assert!(
             entries
                 .iter()
-                .any(|e| e.0 == 161 && e.1 == "udp" && e.2 == "snmp")
+                .any(|e| e.0 == 161 && e.1 == "udp" && e.2 == "open|filtered" && e.3 == "snmp")
         );
         assert!(
             entries
                 .iter()
-                .any(|e| e.0 == 500 && e.1 == "udp" && e.2 == "isakmp")
+                .any(|e| e.0 == 500 && e.1 == "udp" && e.2 == "open" && e.3 == "isakmp")
         );
     }
 
@@ -1958,11 +2239,12 @@ PORT     STATE         SERVICE
         let ssh = &entries[0];
         assert_eq!(ssh.0, 22);
         assert_eq!(ssh.1, "tcp");
-        assert_eq!(ssh.2, "ssh");
-        assert!(ssh.3.contains("OpenSSH"));
+        assert_eq!(ssh.2, "open");
+        assert_eq!(ssh.3, "ssh");
+        assert!(ssh.4.contains("OpenSSH"));
 
         let mysql = entries.iter().find(|e| e.0 == 3306).unwrap();
-        assert_eq!(mysql.2, "mysql");
+        assert_eq!(mysql.3, "mysql");
     }
 
     #[test]
@@ -2083,5 +2365,77 @@ PORT     STATE         SERVICE
         // a mode row carrying an emoji must still pad out to the full width
         let row = banner_kv("mode", &format!("{} fast", "⚡".yellow()));
         assert_eq!(visible_width(&row), BANNER_TOTAL);
+    }
+
+    // ── finalize_report (REVIEW.md finding 1) ─────────────────────
+    // The error path must flush the same artefacts as a successful run — a core
+    // phase failure (e.g. tcp::scan) records its error in the report and the
+    // report still lands on disk.
+
+    #[tokio::test]
+    async fn finalize_report_writes_txt_and_json_with_recorded_error() {
+        let tmp = TmpDir::new("finalize_json");
+        let report = Report::new();
+        report.add("pwnbox  Testbox  →  10.10.10.3").await;
+        report.add_error("TCP", "simulated tcp scan failure").await;
+
+        let report_path = tmp.path().join("report.txt");
+        finalize_report(&report, &report_path, true).await;
+
+        let txt = std::fs::read_to_string(&report_path).unwrap();
+        assert!(txt.contains("pwnbox  Testbox"));
+
+        let json_path = report_path.with_extension("json");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json_path).unwrap()).unwrap();
+        assert_eq!(json["errors"][0], "TCP: simulated tcp scan failure");
+    }
+
+    #[tokio::test]
+    async fn finalize_report_without_json_writes_only_txt() {
+        let tmp = TmpDir::new("finalize_plain");
+        let report = Report::new();
+        report.add("partial findings").await;
+
+        let report_path = tmp.path().join("report.txt");
+        finalize_report(&report, &report_path, false).await;
+
+        assert!(report_path.exists());
+        assert!(!report_path.with_extension("json").exists());
+    }
+
+    // ── TaskRegistry (REVIEW.md finding 3) ────────────────────────
+
+    #[tokio::test]
+    async fn task_registry_abort_all_cancels_background_tasks() {
+        let registry = TaskRegistry::default();
+        let handle = registry.spawn(async {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        });
+        registry.abort_all();
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
+    /// Throwaway directory under the system temp dir, removed on drop.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("pwnbox_main_test_{}_{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TmpDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }

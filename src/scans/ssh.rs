@@ -5,11 +5,11 @@ use crate::report::Report;
 use crate::runner;
 
 /// Grab the SSH banner and flag known-weak versions.
-pub async fn check(ip: &str, report: &Report) -> Result<()> {
+pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
     report.section("SSH").await;
 
     // quick banner grab — SSH servers send their banner on connect
-    let output = runner::tcp_probe(ip, 22, b"", 5).await?;
+    let output = runner::tcp_probe(ip, port, b"", 5).await?;
 
     let banner = output.lines().next().unwrap_or("").trim();
     if !banner.is_empty() {
@@ -47,4 +47,39 @@ pub async fn check(ip: &str, report: &Report) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REVIEW.md finding 7: the detected port must reach tcp_probe — a banner
+    /// served on a non-standard port (2222, not 22) has to be picked up.
+    #[tokio::test]
+    async fn check_uses_the_detected_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:2222")
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(b"SSH-2.0-OpenSSH_8.9p1 test-banner\r\n")
+                .await
+                .unwrap();
+            // socket drops here -> EOF ends the client's read immediately
+        });
+
+        let report = Report::new();
+        check("127.0.0.1", 2222, &report).await.unwrap();
+        server.await.unwrap();
+
+        assert!(
+            report
+                .lines()
+                .await
+                .iter()
+                .any(|l| l.contains("SSH-2.0-OpenSSH_8.9p1 test-banner")),
+            "banner from port 2222 must reach the report"
+        );
+    }
 }

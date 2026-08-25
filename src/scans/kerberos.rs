@@ -36,15 +36,25 @@ pub async fn enumerate(
         domain.unwrap_or_else(|| hostname.split_once('.').map(|x| x.1).unwrap_or("htb"));
 
     println!("{} kerbrute userenum...", "[*]".cyan());
-    let output =
-        runner::run_cmd(&kerbrute, &["userenum", "-d", kerb_domain, "--dc", ip, &wl]).await?;
+    // 10-minute floor, and the default wordlist is now names.txt (~10k
+    // entries), which finishes well inside it — an 8.3M-entry list like
+    // xato-net-10-million can never make it and only ever burned the timeout
+    // (REVIEW.md finding 10)
+    let output = runner::run_cmd_timeout(
+        &kerbrute,
+        &["userenum", "-d", kerb_domain, "--dc", ip, &wl],
+        runner::default_timeout().max(600),
+    )
+    .await?;
 
     let valid_lines: Vec<&str> = output.lines().filter(|l| l.contains("VALID")).collect();
 
     if !valid_lines.is_empty() {
         println!("{} Valid users found!", "[+]".green());
+        for line in &valid_lines {
+            println!("{}", line.green().bold());
+        }
         let text = valid_lines.join("\n");
-        println!("{text}");
         report.add(&text).await;
     } else {
         println!("{} No valid users found", "[!]".yellow());

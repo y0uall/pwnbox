@@ -128,11 +128,12 @@ Reports are saved to `~/htb/<boxname>/`:
 ~/htb/lame/
   lame-20260331-180059.txt      text report
   lame-20260331-180059.json     JSON report (with --json)
-  nmap-tcp.txt                  raw nmap TCP output
-  nmap-udp.txt                  raw nmap UDP output
-  nmap-vuln.txt                 vuln scan output
-  ferox-80.txt                  directory brute results
-  vhosts-443.txt                virtual host discoveries
+  raw/                          raw tool output (also the --resume cache)
+    nmap-tcp.txt                raw nmap TCP output
+    nmap-udp.txt                raw nmap UDP output
+    nmap-vuln.txt               vuln scan output
+    ferox-80.txt                directory brute results
+    vhosts-443.txt              virtual host discoveries
 ```
 
 ## Configuration

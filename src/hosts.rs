@@ -82,7 +82,8 @@ pub async fn add_hosts(ip: &str, hostnames: &[String]) -> Result<()> {
         lines.push(new_line);
     }
 
-    // pipe through sudo tee (no shell injection risk since content goes via stdin)
+    // hand the assembled content to sudo install via a temp file (content is
+    // data, never interpolated into a shell command)
     let content = lines.join("\n") + "\n";
     // a failed /etc/hosts write must NOT abort the whole scan — warn and continue
     if let Err(e) = write_hosts_sudo(&content).await {
@@ -104,16 +105,32 @@ async fn write_hosts_sudo(content: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let tmp = format!("/tmp/hosts.pwnbox.{}", std::process::id());
+    // /tmp is world-writable: a predictable name (pid only) would let a local
+    // attacker pre-create or swap the file before `sudo install` reads it back
+    // (REVIEW.md finding 14). pid+nanos is unguessable enough, create_new
+    // refuses to follow a planted file, and 0600 keeps others from rewriting
+    // the content between our write and the install.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = format!("/tmp/hosts.pwnbox.{}.{nanos}", std::process::id());
 
     // write temp file as the current user
     {
-        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await?;
         file.write_all(content.as_bytes()).await?;
         file.flush().await?;
     }
 
     // atomically install it as /etc/hosts (preserving permissions)
+    // kill_on_drop: without it a timed-out sudo would survive as an orphan
+    // when the child handle is dropped on the timeout path below
     let mut child = Command::new("sudo")
         .args([
             "-n",
@@ -129,6 +146,7 @@ async fn write_hosts_sudo(content: &str) -> Result<()> {
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
 
     let result = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;

@@ -6,6 +6,11 @@ use crate::report::Report;
 use crate::runner;
 
 /// Poke WinRM to see if it's alive.
+///
+/// Probes with POST (WinRM's SOAP method): without credentials a live listener
+/// answers 401, and an empty envelope gets 400/500 — all prove the endpoint
+/// exists. The old GET probe turned the 404/405 of a perfectly alive
+/// Microsoft-HTTPAPI listener into a false "not responding".
 pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) -> Result<()> {
     report.section("WINRM").await;
 
@@ -20,6 +25,10 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
             "-sk",
             "--max-time",
             "5",
+            "-X",
+            "POST",
+            "-d",
+            "",
             "-o",
             "/dev/null",
             "-w",
@@ -34,7 +43,7 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
         anyhow::bail!("WinRM curl probe failed: {}", output.trim());
     }
     let status = output.trim();
-    if status == "401" || status == "200" || status == "403" {
+    if matches!(status, "200" | "400" | "401" | "403" | "405" | "500") {
         println!("{} WinRM is active (HTTP {status})", "[+]".green());
         report
             .add(&format!("  WinRM active on port {port} (HTTP {status})"))
@@ -52,7 +61,9 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
     } else {
         println!("{} WinRM not responding (HTTP {status})", "[!]".yellow());
         report
-            .add(&format!("  WinRM port {port}: not responding"))
+            .add(&format!(
+                "  WinRM port {port}: not responding (HTTP {status})"
+            ))
             .await;
     }
 
