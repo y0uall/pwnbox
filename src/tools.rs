@@ -83,6 +83,12 @@ const TOOL_DEFS: &[ToolDef] = &[
         required: false,
     },
     ToolDef {
+        name: "smbmap",
+        alternatives: &[],
+        modules: &["smb"],
+        required: false,
+    },
+    ToolDef {
         name: "rpcclient",
         alternatives: &[],
         modules: &["rpc"],
@@ -127,6 +133,12 @@ const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "kerbrute",
         alternatives: &[],
+        modules: &["kerberos"],
+        required: false,
+    },
+    ToolDef {
+        name: "impacket-GetNPUsers",
+        alternatives: &["GetNPUsers.py"],
         modules: &["kerberos"],
         required: false,
     },

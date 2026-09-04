@@ -177,12 +177,14 @@ impl WordlistsConfig {
                     "[*]".cyan()
                 );
             }
-            // names.txt (~10k entries) first: it finishes within the kerbrute
-            // timeout, the 8.3M-entry xato list structurally cannot
+            // Ordered by "finishes inside the kerbrute timeout": names.txt
+            // (~10k) first, then the short shortlist, and the 8.3M-entry xato
+            // list last — it structurally cannot finish, so it's a last resort
+            // rather than sitting ahead of the shortlist.
             self.usernames = vec![
                 "/opt/SecLists/Usernames/Names/names.txt".into(),
-                "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt".into(),
                 "/opt/SecLists/Usernames/top-usernames-shortlist.txt".into(),
+                "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt".into(),
             ];
         }
         if self.usernames_short.is_empty() {
@@ -219,11 +221,47 @@ impl FileConfig {
             }
             (c, false)
         };
+        Self::load_from_candidates(&candidates, explicit)
+    }
 
-        for path in &candidates {
+    /// Load from an ordered candidate list. Split out from `load` (which builds
+    /// the candidates from CWD/HOME) so the parse / fallback / tools-trust logic
+    /// is unit-testable without changing the process working directory.
+    fn load_from_candidates(candidates: &[PathBuf], explicit: bool) -> Result<Self> {
+        for path in candidates {
             if path.exists() {
-                let content = std::fs::read_to_string(path)?;
-                let mut cfg: FileConfig = toml::from_str(&content)?;
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) if explicit => {
+                        return Err(anyhow::anyhow!("could not read {}: {e}", path.display()));
+                    }
+                    Err(e) => {
+                        // an auto-discovered file we can't read shouldn't kill
+                        // the scan — warn and fall through to the next candidate
+                        println!(
+                            "{} Could not read {} ({e}) — skipping",
+                            "[!]".yellow(),
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
+                let mut cfg: FileConfig = match toml::from_str(&content) {
+                    Ok(c) => c,
+                    Err(e) if explicit => {
+                        anyhow::bail!("could not parse {}: {e}", path.display());
+                    }
+                    Err(e) => {
+                        // a typo in an auto-discovered config shouldn't abort the
+                        // run — warn and fall back to defaults instead
+                        println!(
+                            "{} Ignoring malformed {} ({e}) — using defaults",
+                            "[!]".yellow(),
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
                 cfg.wordlists = cfg.wordlists.with_defaults();
 
                 cfg.source = if explicit {
@@ -253,8 +291,8 @@ impl FileConfig {
             }
         }
 
-        // nothing found, just go with hardcoded defaults
-        println!("{} No config.toml found — using defaults", "[*]".dimmed());
+        // nothing found (or every candidate was malformed) — hardcoded defaults
+        println!("{} No usable config.toml — using defaults", "[*]".dimmed());
         Ok(FileConfig {
             wordlists: WordlistsConfig::default().with_defaults(),
             ..Default::default()
@@ -727,6 +765,29 @@ nmap = "/malicious/nmap"
         assert_eq!(cfg.source, ConfigSource::Local);
         assert!(cfg.tools.nmap.is_empty());
         assert!(cfg.tools.is_empty());
+    }
+
+    // These drive load_from_candidates directly with explicit paths, so they
+    // never touch the process CWD — safe under parallel test execution (a
+    // CWD-changing test races the shell-out tests in runner.rs).
+    #[test]
+    fn malformed_auto_config_falls_back_to_defaults() {
+        let tmp = TmpDir::new("bad_auto");
+        let p = tmp.path().join("config.toml");
+        std::fs::write(&p, "this = = not valid toml\n").unwrap();
+        // non-explicit candidate: a typo must not abort the run — fall back
+        let cfg = FileConfig::load_from_candidates(&[p], false)
+            .expect("malformed auto config should fall back, not error");
+        assert!(!cfg.wordlists.usernames.is_empty());
+    }
+
+    #[test]
+    fn malformed_explicit_config_stays_a_hard_error() {
+        let tmp = TmpDir::new("bad_explicit");
+        let p = tmp.path().join("config.toml");
+        std::fs::write(&p, "nope = = broken\n").unwrap();
+        // an explicit --config path stays strict
+        assert!(FileConfig::load_from_candidates(&[p], true).is_err());
     }
 
     /// Throwaway directory under the system temp dir, removed on drop.

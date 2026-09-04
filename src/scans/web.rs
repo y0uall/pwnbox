@@ -119,6 +119,23 @@ struct PortProbe {
     /// (`-w '%{size_download}'`) — the ffuf `-fs` baseline. None in fast mode
     /// or when the size probe failed; vhost brute-forcing is skipped then
     body_size: Option<u64>,
+    /// the `Server:` response header (empty if none) — drives the feroxbuster
+    /// `-x` extension list (IIS wants asp/aspx, everything else on HTB is PHP)
+    server: String,
+}
+
+/// feroxbuster `-x` extensions picked from the `Server:` header. Without `-x`,
+/// ferox only ever finds directories and misses the actual scripts/files that
+/// are the point of the brute on most HTB web boxes. IIS boxes want asp/aspx;
+/// everything else is overwhelmingly PHP. txt/html always earn their place
+/// (config dumps, static pages, backups).
+fn ferox_extensions(server: &str) -> &'static str {
+    let s = server.to_lowercase();
+    if s.contains("iis") || s.contains("asp.net") {
+        "asp,aspx,txt,html"
+    } else {
+        "php,txt,html"
+    }
 }
 
 /// Probe one HTTP port: headers + body (concurrently), redirect check, vhost
@@ -134,6 +151,7 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
         redirect_hosts: Vec::new(),
         probe_ok: false,
         body_size: None,
+        server: String::new(),
     };
 
     let url = format!("{scheme}://{}:{port}", ctx.ip);
@@ -222,6 +240,7 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
         .captures(&hdr_output)
         .map(|c| c[1].trim().replace('\r', ""))
         .unwrap_or_default();
+    probe.server = server.clone();
 
     let title = RE_HTML_TITLE
         .captures(&body_output)
@@ -494,8 +513,9 @@ pub async fn enumerate(
                 let ferox_out_str = ferox_out.to_string_lossy().to_string();
                 let ferox_threads = scan_cfg.ferox_threads;
                 let ferox_cmd = ferox_bin.clone();
+                let exts = ferox_extensions(&probe.server);
                 println!(
-                    "{} feroxbuster on port {port} (background)...",
+                    "{} feroxbuster on port {port} (background, -x {exts})...",
                     "[*]".cyan()
                 );
                 background_tasks.push(tokio::spawn(async move {
@@ -511,6 +531,8 @@ pub async fn enumerate(
                             &ferox_url,
                             "-w",
                             &wl,
+                            "-x",
+                            exts,
                             "-k",
                             "-q",
                             "--no-state",
@@ -650,7 +672,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    use super::{detect_http_ports, enumerate};
+    use super::{detect_http_ports, enumerate, ferox_extensions};
     use crate::config::{ScanConfig, ToolsConfig, WordlistsConfig};
     use crate::report::Report;
 
@@ -714,6 +736,14 @@ Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel";
 |_    500 Invalid command: try being more creative
 Service Info: OS: Linux";
         assert!(detect_http_ports(output).is_empty());
+    }
+
+    #[test]
+    fn ferox_extensions_pick_aspx_for_iis_php_otherwise() {
+        assert_eq!(ferox_extensions("Microsoft-IIS/10.0"), "asp,aspx,txt,html");
+        assert_eq!(ferox_extensions("Apache/2.4.52 (Ubuntu)"), "php,txt,html");
+        assert_eq!(ferox_extensions("nginx/1.18.0"), "php,txt,html");
+        assert_eq!(ferox_extensions(""), "php,txt,html"); // no Server header
     }
 
     /// ScanConfig with stubbed tools so enumerate() runs end-to-end without

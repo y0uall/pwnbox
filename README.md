@@ -37,7 +37,7 @@ Everything gets collected into a **text report**, an optional **JSON report**, a
 
 ## Features
 
-- **20 service modules** with automatic detection based on open ports
+- **14 service modules** with automatic detection based on open ports
 - **Parallel execution** via tokio — service scans, dir brute, vhost scan all run concurrently
 - **Default credential testing** for MySQL, PostgreSQL, Redis, MSSQL, FTP
 - **SSL cert hostname discovery** — extracts CN/SAN from HTTPS certs
@@ -184,7 +184,7 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.88+ (edition 2024 plus stable let-chains).
 
 ## License
 

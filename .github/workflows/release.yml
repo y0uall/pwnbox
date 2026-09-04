@@ -30,8 +30,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Verify tag matches crate version
+        run: |
+          crate="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches crate version ${crate}"
+
       - name: Build release binary
-        run: cargo build --release --verbose
+        run: cargo build --release --verbose --locked
 
       - name: Generate SHA256 checksums
         run: |

@@ -131,10 +131,12 @@ impl Report {
 
     pub async fn add_service_finding(&self, service: &str, finding: &str) {
         let mut data = self.json_data.lock().await;
-        data.services
-            .entry(service.to_string())
-            .or_default()
-            .push(finding.to_string());
+        // dedup like every other field: the same finding can reach here from two
+        // code paths, and it shouldn't show up twice in the JSON/summary
+        let entry = data.services.entry(service.to_string()).or_default();
+        if !entry.iter().any(|f| f == finding) {
+            entry.push(finding.to_string());
+        }
     }
 
     pub async fn add_hostname(&self, hostname: &str) {
@@ -210,10 +212,12 @@ impl Report {
             }
         }
         for (svc, findings) in &src.services {
-            dst.services
-                .entry(svc.clone())
-                .or_default()
-                .extend(findings.iter().cloned());
+            let dst_findings = dst.services.entry(svc.clone()).or_default();
+            for f in findings {
+                if !dst_findings.contains(f) {
+                    dst_findings.push(f.clone());
+                }
+            }
         }
         for h in &src.hostnames {
             if !dst.hostnames.contains(h) {
@@ -286,5 +290,16 @@ mod tests {
         let data = r.json_mut().await;
         let keys: Vec<String> = data.services.keys().cloned().collect();
         assert_eq!(keys, vec!["ssh", "web"]);
+    }
+
+    #[tokio::test]
+    async fn add_service_finding_dedups_repeats() {
+        let r = Report::new();
+        r.add_service_finding("ssh", "root login").await;
+        r.add_service_finding("ssh", "root login").await; // same finding again
+        r.add_service_finding("ssh", "port 22 open").await;
+
+        let data = r.json_mut().await;
+        assert_eq!(data.services["ssh"], vec!["root login", "port 22 open"]);
     }
 }

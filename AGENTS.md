@@ -11,8 +11,9 @@ pentest tools (nmap, rustscan, feroxbuster, ffuf/gobuster, enum4linux-ng,
 crackmapexec/netexec, ldapsearch, kerbrute, …) in a 6-phase async pipeline and
 produces a text report (plus optional JSON) in `~/htb/<box>/`.
 
-- Language: **Rust** (edition 2024, requires Rust 1.85+), platform: **Linux only**
-- Version: 0.7.0, license: MIT
+- Language: **Rust** (edition 2024 + stable let-chains, requires Rust 1.88+), platform: **Linux only**
+- License: MIT. The version is authoritative in `Cargo.toml` only — never
+  hardcode it here; the CLI string comes from `env!("CARGO_PKG_VERSION")`.
 - Crate type: binary only, no lib target. Everything lives under `src/`.
 - Runtime: **tokio** multi-thread; heavy parallelism via `tokio::spawn` /
   `tokio::join!` / `JoinHandle`s.
@@ -38,9 +39,10 @@ src/tools.rs        startup tool-dependency checker (TOOL_DEFS table)
 src/scans/          one module per scan phase/service (19 modules)
 .github/workflows/  ci.yml (fmt/build/test/clippy/shellcheck/audit),
                     release.yml (tag-triggered GitHub release)
-REVIEW.md           untracked German-language code review listing known open
-                    issues (abort paths, orphaned sudo processes, etc.) —
-                    consult it before "fixing" something it already documents
+(REVIEW.md)         historical, no longer in the repo. The many
+                    `(REVIEW.md finding N)` / `(REVIEW.md "Niedrig")` comments
+                    in the source are just markers explaining past fixes —
+                    there is no file to open, so don't go looking for one.
 ```
 
 ## Architecture

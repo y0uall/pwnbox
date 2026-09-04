@@ -419,7 +419,13 @@ async fn capture_output_pgroup(cmd: &str, args: &[&str], timeout_secs: u64) -> R
 /// signal path) kills the whole process group — plain `kill_on_drop` would kill
 /// only sudo and leave the privileged tool it launched running as an orphan.
 pub async fn run_sudo_cmd_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String> {
-    let mut sudo_args = vec![cmd];
+    // -n (never prompt): has_sudo() — itself `sudo -n` — gates every caller, but
+    // the cached sudo timestamp can lapse mid-scan (e.g. the UDP scan after a
+    // long `-p-` TCP scan). Without -n, sudo would then prompt for a password on
+    // the piped, invisible stderr and hang until the timeout fires. -n turns that
+    // into a fast, visible failure instead (same invisible-prompt class as the
+    // interactive path already guards against).
+    let mut sudo_args = vec!["-n", cmd];
     sudo_args.extend_from_slice(args);
     let output = capture_output_pgroup("sudo", &sudo_args, timeout_secs).await?;
     let result = combined_output(&output);

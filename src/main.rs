@@ -1186,10 +1186,11 @@ async fn run_scan(
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
+        let rd = raw_dir.clone();
         svc_handles.push((
             "SMB",
             registry.spawn(async move {
-                scans::smb::enumerate(&ip, &sc, &r).await?;
+                scans::smb::enumerate(&ip, &sc, &rd, &r).await?;
                 Ok(r)
             }),
         ));
@@ -1359,8 +1360,9 @@ async fn run_scan(
         let r = Report::new();
         let ip = cfg.ip.clone();
         let sc = scan_cfg.clone();
+        let rd = raw_dir.clone();
         Some(registry.spawn(async move {
-            let domain = scans::ldap::enumerate(&ip, ldap_port, &sc, &r).await?;
+            let domain = scans::ldap::enumerate(&ip, ldap_port, &sc, &rd, &r).await?;
             Ok((r, domain))
         }))
     } else {
@@ -1407,8 +1409,9 @@ async fn run_scan(
         let hostname = cfg.hostname.clone();
         let domain = ldap_domain.clone();
         let sc = scan_cfg.clone();
+        let rd = raw_dir.clone();
         Some(registry.spawn(async move {
-            scans::kerberos::enumerate(&ip, &hostname, domain.as_deref(), &sc, &r).await?;
+            scans::kerberos::enumerate(&ip, &hostname, domain.as_deref(), &sc, &rd, &r).await?;
             Ok(r)
         }))
     } else {

@@ -35,13 +35,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose --locked
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --verbose --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Shellcheck setup.sh
         run: shellcheck setup.sh
@@ -65,9 +65,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-audit-
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        # prebuilt binary — avoids recompiling cargo-audit from source every run
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Audit dependencies
-        # Fail on anything actionable (critical/high/medium). Informational
-        # advisories are reported but do not break the build.
-        run: cargo audit --deny warnings
+        # Fail only on actual vulnerabilities (cargo audit's default). Warning-
+        # class advisories (unmaintained/unsound/yanked) are reported but must
+        # not break CI on an unrelated push.
+        run: cargo audit

@@ -28,12 +28,14 @@ dns_subdomains = [
     "/usr/share/dnsrecon/subdomains-top1mil-5000.txt",
 ]
 
-# Username wordlists (first existing file wins — names.txt finishes inside
-# the 10-minute kerbrute timeout; the 8.3M-entry xato list cannot)
+# Username wordlists (first existing file wins). Ordered by "finishes inside
+# the 10-minute kerbrute timeout": names.txt (~10k) first, then the short
+# shortlist, and only then the 8.3M-entry xato list — which structurally cannot
+# finish, so it sits last as a deliberate last resort.
 usernames = [
     "/opt/SecLists/Usernames/Names/names.txt",
-    "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt",
     "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
+    "/opt/SecLists/Usernames/xato-net-10-million-usernames.txt",
 ]
 usernames_short = [
     "/opt/SecLists/Usernames/top-usernames-shortlist.txt",
