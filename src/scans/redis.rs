@@ -32,8 +32,8 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
             let lines: Vec<&str> = output.lines().take(15).collect();
             let text = lines.join("\n");
             println!("{text}");
-            report.add("  Unauthenticated: YES").await;
-            report.add(&text).await;
+            report.add_service("redis", "  Unauthenticated: YES").await;
+            report.add_service("redis", &text).await;
             report.add_vuln("Redis: unauthenticated access").await;
             return Ok(());
         }
@@ -115,7 +115,9 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
                     "[+]".green().bold(),
                     pass.red()
                 );
-                report.add(&format!("  Auth: YES (password: {pass})")).await;
+                report
+                    .add_service("redis", &format!("  Auth: YES (password: {pass})"))
+                    .await;
                 report
                     .add_vuln(&format!("Redis: default password '{pass}'"))
                     .await;
@@ -128,13 +130,16 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
 
             println!("{} Common passwords denied", "[!]".yellow());
             report
-                .add("  Unauthenticated: NO (auth required, common passwords failed)")
+                .add_service(
+                    "redis",
+                    "  Unauthenticated: NO (auth required, common passwords failed)",
+                )
                 .await;
         } else if !probe_ok {
             bail!("redis-cli failed: {}", output.trim());
         } else {
             println!("{} Redis connection failed or refused", "[!]".yellow());
-            report.add("  (connection failed)").await;
+            report.add_service("redis", "  (connection failed)").await;
         }
     } else {
         // no redis-cli, fall back to a raw TCP probe
@@ -147,12 +152,14 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
             );
             let snippet = output.lines().take(15).collect::<Vec<_>>().join("\n");
             println!("{snippet}");
-            report.add("  Unauthenticated: YES").await;
-            report.add(&snippet).await;
+            report.add_service("redis", "  Unauthenticated: YES").await;
+            report.add_service("redis", &snippet).await;
             report.add_vuln("Redis: unauthenticated access").await;
         } else {
             println!("{} Redis not accessible without auth", "[!]".yellow());
-            report.add("  (not accessible or auth required)").await;
+            report
+                .add_service("redis", "  (not accessible or auth required)")
+                .await;
         }
     }
 

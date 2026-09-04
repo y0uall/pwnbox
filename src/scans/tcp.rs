@@ -13,8 +13,9 @@ use crate::scans::port_detail_lines;
 
 // Precompiled once — these run over every nmap TCP result, sometimes repeatedly.
 static RE_RUSTSCAN_PORTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9,]+)\]").unwrap());
-static RE_VULN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(VULNERABLE|CVE-\d{4}-\d+)").unwrap());
+static RE_CVE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bCVE-\d{4}-\d+\b").unwrap());
+static RE_SCRIPT_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\|[_ ]([a-z][a-z0-9_-]*):[ \t]*(.*)$").unwrap());
 // Generic hostname extraction: no longer limited to *.htb. Invalid or local-only
 // names are filtered out by `hosts::is_valid_hostname` before /etc/hosts is touched.
 static RE_SSL_HOST: LazyLock<Regex> =
@@ -214,20 +215,23 @@ pub async fn vuln_scan(
 
     if vulns.is_empty() {
         println!(
-            "{} No vulnerabilities found by nmap scripts",
+            "{} No positive vulnerability findings reported by nmap scripts",
             "[!]".yellow()
         );
-        report.add("  (no vulnerabilities found)").await;
+        report
+            .add("  (no positive nmap vulnerability findings)")
+            .await;
     } else {
         println!(
-            "{} Found {} vulnerability/ies!",
-            "[+]".green().bold(),
+            "{} Nmap reported {} potential vulnerability finding(s) — verify manually",
+            "[!]".yellow().bold(),
             vulns.len()
         );
         for v in &vulns {
-            println!("  {} {}", "!!".red().bold(), v.red());
-            report.add(&format!("  !! {v}")).await;
-            report.add_vuln(v).await;
+            let finding = format!("nmap (unverified): {v}");
+            println!("  {} {}", "!!".yellow().bold(), finding.yellow());
+            report.add(&format!("  !! {finding}")).await;
+            report.add_vuln(&finding).await;
         }
     }
 
@@ -249,50 +253,95 @@ fn is_negative_verdict(line: &str) -> bool {
 /// VULNERABLE" (REVIEW.md finding 12). A block is dropped when any of its
 /// lines carries a negative verdict.
 fn parse_vulns(output: &str) -> Vec<String> {
-    let mut vulns: Vec<String> = Vec::new();
-    let mut in_vuln_block = false;
-    let mut block_negative = false;
-    let mut current_vuln = String::new();
-
-    for line in output.lines() {
-        if line.contains("VULNERABLE") && !is_negative_verdict(line) {
-            in_vuln_block = true;
-            block_negative = false;
-            // strip the nmap script-output prefix ("|     State: ...") — the
-            // finding text shouldn't carry the raw pipe into the report
-            current_vuln = line.trim_start().trim_start_matches('|').trim().to_string();
-        } else if in_vuln_block {
-            if line.starts_with("|_") {
-                // end of vuln block
-                if !block_negative && !current_vuln.is_empty() {
-                    vulns.push(current_vuln.clone());
-                }
-                in_vuln_block = false;
-                block_negative = false;
-                current_vuln.clear();
-            } else if line.starts_with("|") {
-                if is_negative_verdict(line) {
-                    // e.g. "|     State: NOT VULNERABLE" — the block is a
-                    // negative result, not a finding
-                    block_negative = true;
-                } else if let Some(cap) = RE_VULN.captures(line)
-                    && cap[0].to_ascii_uppercase().starts_with("CVE")
-                {
-                    // continuation, capture CVE IDs
-                    current_vuln.push_str(&format!(" ({})", &cap[0]));
-                }
-            } else {
-                // a non-pipe line ends the block
-                if !block_negative && !current_vuln.is_empty() {
-                    vulns.push(current_vuln.clone());
-                }
-                in_vuln_block = false;
-                block_negative = false;
-                current_vuln.clear();
-            }
-        }
+    #[derive(Default)]
+    struct Finding {
+        positive: bool,
+        negative: bool,
+        title: String,
+        cves: Vec<String>,
     }
 
+    fn flush(finding: &mut Finding, scope: &str, script: &str, vulns: &mut Vec<String>) {
+        if finding.positive && !finding.negative {
+            let context = [scope, script]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut text = if context.is_empty() {
+                "VULNERABLE".to_string()
+            } else {
+                format!("{context}: VULNERABLE")
+            };
+            if !finding.title.is_empty() {
+                text.push_str(&format!(" — {}", finding.title));
+            }
+            for cve in &finding.cves {
+                if !text.to_ascii_uppercase().contains(cve) {
+                    text.push_str(&format!(" ({cve})"));
+                }
+            }
+            if !vulns.contains(&text) {
+                vulns.push(text);
+            }
+        }
+        *finding = Finding::default();
+    }
+
+    let mut vulns = Vec::new();
+    let mut finding = Finding::default();
+    let mut scope = String::new();
+    let mut script = String::new();
+    for line in output.lines() {
+        if !line.starts_with('|') {
+            flush(&mut finding, &scope, &script, &mut vulns);
+            script.clear();
+            scope = if super::RE_PORT_LINE.is_match(line) {
+                line.split_whitespace().next().unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            continue;
+        }
+        let header = RE_SCRIPT_HEADER.captures(line);
+        let body = if let Some(header) = &header {
+            flush(&mut finding, &scope, &script, &mut vulns);
+            script = header[1].to_string();
+            header.get(2).map_or("", |body| body.as_str()).trim()
+        } else {
+            line.trim_start_matches('|').trim_start_matches('_').trim()
+        };
+        // Multiple findings may share one script. State lines update the
+        // verdict without replacing the preceding human-readable title.
+        if body.eq_ignore_ascii_case("VULNERABLE:") && finding.positive {
+            flush(&mut finding, &scope, &script, &mut vulns);
+        }
+        if is_negative_verdict(body) {
+            finding.negative = true;
+        } else if body.to_ascii_uppercase().contains("VULNERABLE") {
+            finding.positive = true;
+        } else if finding.positive
+            && finding.title.is_empty()
+            && !body.is_empty()
+            && !body.contains(':')
+            && !RE_CVE.is_match(body)
+        {
+            finding.title = body.to_string();
+        }
+        // IDs and reference URLs frequently repeat the same CVE, including
+        // on the closing |_ line. Preserve all distinct IDs exactly once.
+        for cve in RE_CVE.find_iter(body) {
+            let cve = cve.as_str().to_ascii_uppercase();
+            if !finding.cves.contains(&cve) {
+                finding.cves.push(cve);
+            }
+        }
+        if line.starts_with("|_") {
+            flush(&mut finding, &scope, &script, &mut vulns);
+            script.clear();
+        }
+    }
+    flush(&mut finding, &scope, &script, &mut vulns);
     vulns
 }
 
@@ -436,8 +485,7 @@ mod tests {
 
     #[test]
     fn vuln_findings_drop_the_pipe_prefix() {
-        // findings are reported as "State: VULNERABLE (CVE-...)" — without the
-        // raw nmap script-output prefix
+        // Human-readable findings must not carry nmap's raw pipe prefix.
         let output = "\
 | http-vuln-cve2011-3192:
 |   VULNERABLE:
@@ -448,6 +496,35 @@ mod tests {
         let vulns = parse_vulns(output);
         assert_eq!(vulns.len(), 1);
         assert!(!vulns[0].starts_with('|'), "raw pipe leaked: {}", vulns[0]);
+    }
+
+    #[test]
+    fn vuln_parser_preserves_live_scan_context_and_deduplicates_cves() {
+        let output = "443/tcp open https
+| http-vuln-cve2011-3192:
+|   VULNERABLE:
+|   Apache byterange filter DoS
+|     State: VULNERABLE
+|     IDs: CVE:CVE-2011-3192 BID:49303
+|     References:
+|_      https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2011-3192";
+        let findings = parse_vulns(output);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].contains("443/tcp http-vuln-cve2011-3192"));
+        assert!(findings[0].contains("Apache byterange filter DoS"));
+        assert_eq!(findings[0].matches("CVE-2011-3192").count(), 1);
+    }
+
+    #[test]
+    fn vuln_parser_keeps_last_and_inline_findings() {
+        let output = "22/tcp open ssh\n|_test-script: VULNERABLE CVE-2025-1234\n443/tcp open https\n| other-script:\n|   VULNERABLE:\n|   Fixture flaw\n|     State: VULNERABLE\n|     IDs: CVE-2025-5678 CVE-2025-5679";
+        let findings = parse_vulns(output);
+        assert_eq!(findings.len(), 2);
+        assert!(findings[0].contains("22/tcp test-script"));
+        assert!(findings[0].contains("CVE-2025-1234"));
+        assert!(findings[1].contains("443/tcp other-script"));
+        assert!(findings[1].contains("CVE-2025-5678"));
+        assert!(findings[1].contains("CVE-2025-5679"));
     }
 
     /// REVIEW.md finding 12: nmap prints full blocks for negative results too —

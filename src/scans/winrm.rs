@@ -46,10 +46,13 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
     if matches!(status, "200" | "400" | "401" | "403" | "405" | "500") {
         println!("{} WinRM is active (HTTP {status})", "[+]".green());
         report
-            .add(&format!("  WinRM active on port {port} (HTTP {status})"))
+            .add_service(
+                "winrm",
+                &format!("  WinRM active on port {port} (HTTP {status})"),
+            )
             .await;
         report
-            .add("  → Try: evil-winrm -i <ip> -u <user> -p <pass>")
+            .add_service("winrm", "  → Try: evil-winrm -i <ip> -u <user> -p <pass>")
             .await;
 
         if runner::command_exists("evil-winrm").await {
@@ -61,9 +64,10 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
     } else {
         println!("{} WinRM not responding (HTTP {status})", "[!]".yellow());
         report
-            .add(&format!(
-                "  WinRM port {port}: not responding (HTTP {status})"
-            ))
+            .add_service(
+                "winrm",
+                &format!("  WinRM port {port}: not responding (HTTP {status})"),
+            )
             .await;
     }
 

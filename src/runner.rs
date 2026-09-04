@@ -15,6 +15,8 @@ use tokio::process::Command;
 // flags (and their config equivalents) actually take effect everywhere.
 static DEFAULT_TIMEOUT: AtomicU64 = AtomicU64::new(300);
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+// Bound external work across all ports and modules, including background jobs.
+static PROCESS_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
 /// Set the default per-command timeout (seconds) used by `run_cmd`.
 pub fn set_default_timeout(secs: u64) {
@@ -95,13 +97,9 @@ pub async fn command_exists(cmd: &str) -> bool {
 
 /// Check if we can sudo without a password prompt.
 pub async fn has_sudo() -> bool {
-    Command::new("sudo")
-        .args(["-n", "true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    run_cmd_status("sudo", &["-n", "true"], 10)
         .await
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|(success, _)| success)
 }
 
 /// Run a command interactively with inherited stdio and no capture — for the
@@ -169,6 +167,17 @@ async fn capture_output(
     env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<Output> {
+    capture_output_input(cmd, args, env, None, timeout_secs).await
+}
+
+async fn capture_output_input(
+    cmd: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    input: Option<&[u8]>,
+    timeout_secs: u64,
+) -> Result<Output> {
+    let _permit = PROCESS_LIMIT.acquire().await?;
     if is_verbose() {
         eprintln!(
             "{} $ {} {}",
@@ -181,21 +190,41 @@ async fn capture_output(
     let mut command = Command::new(cmd);
     command
         .args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     for (key, value) in env {
         command.env(key, value);
     }
 
-    let child = spawn_transient(&mut command, cmd).await?;
+    let mut child = spawn_transient(&mut command, cmd).await?;
+    let _group = ProcessGroupGuard(child.id());
+    let stdin = child.stdin.take();
+    let output = async {
+        use tokio::io::AsyncWriteExt;
+        let write = async {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                stdin.write_all(input).await?;
+                stdin.shutdown().await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        let output = output?;
+        // Authentication failures can close stdin without consuming the query.
+        if output.status.success() {
+            written?;
+        }
+        Ok::<_, std::io::Error>(output)
+    };
 
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        child.wait_with_output(),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), output).await {
         Ok(result) => result.with_context(|| format!("Failed to wait for {cmd}")),
         Err(_) => anyhow::bail!("{cmd} timed out after {timeout_secs}s"),
     }
@@ -230,6 +259,21 @@ pub async fn run_cmd_status(cmd: &str, args: &[&str], timeout_secs: u64) -> Resu
     run_cmd_status_env(cmd, args, &[], timeout_secs).await
 }
 
+/// Feed a non-interactive command without a shell or a temporary query file.
+pub async fn run_cmd_status_input(
+    cmd: &str,
+    args: &[&str],
+    input: &[u8],
+    timeout_secs: u64,
+) -> Result<(bool, String)> {
+    let output = capture_output_input(cmd, args, &[], Some(input), timeout_secs).await?;
+    let result = combined_output(&output);
+    if is_verbose() && !result.trim().is_empty() {
+        println!("{}", result.trim_end().dimmed());
+    }
+    Ok((output.status.success(), result))
+}
+
 /// `run_cmd_status` with a small, explicit environment overlay.
 pub async fn run_cmd_status_env(
     cmd: &str,
@@ -254,6 +298,21 @@ pub async fn run_cmd_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Res
         return Err(command_failed(cmd, &output));
     }
     Ok(output)
+}
+
+/// Preserve stdout bytes for protocols whose byte counts matter (HTTP bodies).
+pub async fn run_cmd_bytes(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<Vec<u8>> {
+    let output = capture_output(cmd, args, &[], timeout_secs).await?;
+    if !output.status.success() {
+        return Err(command_failed(cmd, &combined_output(&output)));
+    }
+    if is_verbose() && !output.stdout.is_empty() {
+        println!(
+            "{}",
+            String::from_utf8_lossy(&output.stdout).trim_end().dimmed()
+        );
+    }
+    Ok(output.stdout)
 }
 
 // Captures the segments of an nmap port line so the tee'd output below can
@@ -332,102 +391,118 @@ pub async fn run_cmd_tee(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<
     Ok(combined)
 }
 
-/// Kill the child's whole process group on drop unless disarmed.
-///
-/// `kill_on_drop` only SIGKILLs the direct child; for sudo wrappers that leaves
-/// the privileged tool underneath (e.g. `nmap -sU`) running as a root-owned
-/// orphan — both on timeout and on task abort (REVIEW.md findings 3+5).
-struct ProcessGroupGuard {
-    /// pgid of the child's process group (== child pid, see `process_group(0)`).
-    pgid: Option<i32>,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
+/// Kill descendants as well as the direct child, including on task abort.
+/// The guard must run with the same credentials as the child it supervises.
+struct ProcessGroupGuard(Option<u32>);
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if self.armed
-            && let Some(pgid) = self.pgid
-        {
+        if let Some(pgid) = self.0 {
             // SAFETY: kill(2) with a negative pid targets the process group.
             // The result is ignored on purpose: ESRCH just means the group
             // already exited, and anything else (EPERM, ...) can't be handled
             // here anyway — this is best-effort cleanup.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
         }
     }
 }
 
-/// Like `capture_output`, but the child leads its own process group and the
-/// whole group is SIGKILLed when the future is dropped mid-wait (timeout or
-/// task abort). Used for sudo commands only: killing sudo alone would orphan
-/// the root process it launched (REVIEW.md finding 5).
-async fn capture_output_pgroup(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<Output> {
-    use std::os::unix::process::CommandExt;
+pub(crate) const SUDO_WORKER_FLAG: &str = "--internal-sudo-worker";
 
-    if is_verbose() {
-        eprintln!(
-            "{} $ {} {}",
-            "[v]".dimmed(),
-            cmd.dimmed(),
-            args.join(" ").dimmed()
-        );
-    }
+/// Supervise a privileged command from inside the sudo boundary. Closing the
+/// parent's pipe cancels the command even if the parent cannot signal root
+/// processes, or the parent itself is killed. The tool never inherits this
+/// pipe, so a descendant cannot accidentally keep the liveness channel open.
+async fn supervise_command<R: tokio::io::AsyncRead + Unpin>(
+    cmd: &str,
+    args: &[&str],
+    timeout_secs: u64,
+    mut parent: R,
+) -> Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    use tokio::io::AsyncReadExt;
 
-    let mut std_cmd = std::process::Command::new(cmd);
-    std_cmd
+    // Install handlers before spawning: terminal signals must trigger cleanup,
+    // not terminate the supervisor while its separate process group survives.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut command = Command::new(cmd);
+    command
         .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // process_group(0) == setpgid(0, 0): the child leads a new process group
-    // whose pgid is its own pid, so kill(-pid) reaches everything it spawned
-    std_cmd.process_group(0);
-    let mut command = Command::from(std_cmd);
-    command.kill_on_drop(true);
-
-    let child = spawn_transient(&mut command, cmd).await?;
-    let mut guard = ProcessGroupGuard {
-        pgid: child.id().map(|pid| pid as i32),
-        armed: true,
-    };
-
-    let wait = child.wait_with_output();
-    tokio::pin!(wait);
-
-    match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), &mut wait).await {
-        Ok(result) => {
-            // normal completion — nobody left to kill
-            guard.disarm();
-            result.with_context(|| format!("Failed to wait for {cmd}"))
+        .stdin(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = spawn_transient(&mut command, cmd).await?;
+    let group = ProcessGroupGuard(child.id());
+    let mut byte = [0u8; 1];
+    let code = tokio::select! {
+        status = child.wait() => {
+            let status = status?;
+            status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
         }
-        // On timeout (or task abort, which drops this future mid-await) no
-        // explicit kill is needed: locals drop in reverse declaration order, so
-        // the pinned wait-future drops first (kill_on_drop SIGKILLs the direct
-        // child) and `guard` then wipes the whole process group.
-        Err(_) => anyhow::bail!("{cmd} timed out after {timeout_secs}s"),
-    }
+        _ = parent.read(&mut byte) => 130,
+        _ = interrupt.recv() => 130,
+        _ = terminate.recv() => 130,
+        _ = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1))) => {
+            eprintln!("{cmd} timed out after {timeout_secs}s");
+            124
+        }
+    };
+    // Kill under the tool's own UID, then reap before the worker exits.
+    drop(group);
+    child.wait().await?;
+    Ok(code)
+}
+
+/// Internal entry point; invoked before CLI/config loading, with a pipe on
+/// stdin and an explicit timeout. It does not run the normal scan pipeline.
+pub(crate) async fn sudo_worker(args: &[String]) -> Result<i32> {
+    use std::os::fd::AsFd;
+    let (timeout, command) = args.split_first().context("missing worker timeout")?;
+    let timeout = timeout.parse::<u64>().context("invalid worker timeout")?;
+    let (cmd, args) = command.split_first().context("missing worker command")?;
+    let stdin = std::io::stdin().as_fd().try_clone_to_owned()?;
+    let parent = tokio::net::unix::pipe::Receiver::from_owned_fd(stdin)
+        .context("sudo worker requires a parent pipe on stdin")?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    supervise_command(cmd, &args, timeout, parent).await
 }
 
 /// Run a command via sudo with a custom timeout.
 ///
-/// Goes through `capture_output_pgroup` so a timeout (or an abort from the
-/// signal path) kills the whole process group — plain `kill_on_drop` would kill
-/// only sudo and leave the privileged tool it launched running as an orphan.
+/// A second instance of this binary owns the command and its timeout as root.
+/// Cancellation closes stdin instead of SIGKILLing sudo before it can clean up.
 pub async fn run_sudo_cmd_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String> {
+    let _permit = PROCESS_LIMIT.acquire().await?;
     // -n (never prompt): has_sudo() — itself `sudo -n` — gates every caller, but
     // the cached sudo timestamp can lapse mid-scan (e.g. the UDP scan after a
     // long `-p-` TCP scan). Without -n, sudo would then prompt for a password on
     // the piped, invisible stderr and hang until the timeout fires. -n turns that
     // into a fast, visible failure instead (same invisible-prompt class as the
     // interactive path already guards against).
-    let mut sudo_args = vec!["-n", cmd];
-    sudo_args.extend_from_slice(args);
-    let output = capture_output_pgroup("sudo", &sudo_args, timeout_secs).await?;
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new("sudo");
+    command
+        .arg("-n")
+        .arg("--")
+        .arg(executable)
+        .arg(SUDO_WORKER_FLAG)
+        .arg(timeout_secs.to_string())
+        .arg(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Do not kill sudo on drop: the root worker must see EOF and reap its tool.
+    let mut child = spawn_transient(&mut command, "sudo").await?;
+    let parent_pipe = child.stdin.take().context("missing sudo worker pipe")?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs.max(1).saturating_add(5)),
+        child.wait_with_output(),
+    )
+    .await;
+    drop(parent_pipe);
+    let output = result.context("sudo worker did not finish within its deadline")??;
     let result = combined_output(&output);
     if is_verbose() && !result.trim().is_empty() {
         println!("{}", result.trim_end().dimmed());
@@ -506,6 +581,76 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn supervisor_cleans_up_when_parent_disconnects() {
+        let tmp = TmpDir::new("parent_disconnect");
+        let ready = tmp.0.join("ready");
+        let survived = tmp.0.join("survived");
+        let script = format!(
+            "touch {}; (sleep 1; touch {}) & wait",
+            ready.display(),
+            survived.display()
+        );
+        let (parent, reader) = tokio::io::duplex(1);
+        let task =
+            tokio::spawn(
+                async move { supervise_command("sh", &["-c", &script], 10, reader).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(parent);
+        assert_eq!(task.await.unwrap().unwrap(), 130);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!survived.exists());
+    }
+
+    #[tokio::test]
+    async fn supervisor_preserves_exit_status_and_enforces_timeout() {
+        let (_parent, reader) = tokio::io::duplex(1);
+        assert_eq!(
+            supervise_command("sh", &["-c", "exit 7"], 5, reader)
+                .await
+                .unwrap(),
+            7
+        );
+        let (_parent, reader) = tokio::io::duplex(1);
+        assert_eq!(
+            supervise_command("sh", &["-c", "sleep 10"], 1, reader)
+                .await
+                .unwrap(),
+            124
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_runner_abort_kills_descendants() {
+        let tmp = TmpDir::new("abort_descendants");
+        let ready = tmp.0.join("ready");
+        let survived = tmp.0.join("survived");
+        let script = format!(
+            "touch {}; (sleep 1; touch {}) & wait",
+            ready.display(),
+            survived.display()
+        );
+        let task = tokio::spawn(async move { run_cmd_timeout("sh", &["-c", &script], 10).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!survived.exists());
+    }
 
     /// A throwaway directory under the system temp dir, removed on drop.
     struct TmpDir(PathBuf);
@@ -627,7 +772,7 @@ mod tests {
         // in the same process group. Killing only `sh` (the old behaviour) would
         // orphan the subshell, which would then write the marker at ~t+2s.
         let script = format!("(sleep 2; touch {}) & wait", marker.display());
-        let result = capture_output_pgroup("sh", &["-c", &script], 1).await;
+        let result = capture_output("sh", &["-c", &script], &[], 1).await;
         assert!(result.is_err(), "expected the command to time out");
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
@@ -641,7 +786,7 @@ mod tests {
         let tmp = TmpDir::new("pgroup_success");
         let marker = tmp.0.join("grandchild-finished");
         let script = format!("(sleep 1; touch {}) & wait", marker.display());
-        let output = capture_output_pgroup("sh", &["-c", &script], 10)
+        let output = capture_output("sh", &["-c", &script], &[], 10)
             .await
             .unwrap();
         assert!(output.status.success());

@@ -67,7 +67,9 @@ pub async fn check(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Result<(
     let snmpwalk = scan_cfg.tool("snmpwalk");
     if !runner::command_exists(&snmpwalk).await {
         println!("{} snmpwalk not found — skipping SNMP enum", "[!]".yellow());
-        report.add("  (snmpwalk not installed)").await;
+        report
+            .add_service("snmp", "  (snmpwalk not installed)")
+            .await;
         return Ok(());
     }
 
@@ -150,19 +152,21 @@ pub async fn check(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Result<(
             community
         );
         report
-            .add(&format!("  Community string: {community}"))
+            .add_service("snmp", &format!("  Community string: {community}"))
             .await;
         let lines: Vec<&str> = output.lines().take(50).collect();
         let text = lines.join("\n");
         println!("{text}");
-        report.add(&text).await;
+        report.add_service("snmp", &text).await;
     } else {
         if let Some(e) = first_error {
             return Err(e);
         }
 
         println!("{} No SNMP community strings worked", "[!]".yellow());
-        report.add("  (no community strings worked)").await;
+        report
+            .add_service("snmp", "  (no community strings worked)")
+            .await;
 
         // hint: try onesixtyone for a bigger bruteforce
         if runner::command_exists("onesixtyone").await {
@@ -174,7 +178,9 @@ pub async fn check(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Result<(
                     "[*]".cyan()
                 );
             }
-            report.add("  → Try onesixtyone bruteforce").await;
+            report
+                .add_service("snmp", "  → Try onesixtyone bruteforce")
+                .await;
         }
     }
 

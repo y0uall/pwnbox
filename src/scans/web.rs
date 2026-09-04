@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -12,19 +12,53 @@ use crate::hosts;
 use crate::report::Report;
 use crate::runner;
 
+#[derive(Clone, Copy)]
+pub enum WebResultKind {
+    Directory,
+    Vhost,
+}
+
+/// Keep each job tied to the exact file it produces. Aborting enumerate before
+/// it returns must also abort jobs not yet registered by the main pipeline.
+pub struct WebTask {
+    pub handle: JoinHandle<Result<()>>,
+    pub output: PathBuf,
+    pub kind: WebResultKind,
+}
+
+impl Drop for WebTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl WebTask {
+    fn spawn<F>(output: PathBuf, kind: WebResultKind, future: F) -> Self
+    where
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        Self {
+            handle: tokio::spawn(future),
+            output,
+            kind,
+        }
+    }
+}
+
 // HTTP(S) service lines in nmap output, plus the header/body fields we scrape.
 // Match any nmap service field that contains "http" — this covers http, https,
 // ssl/http, http-alt, https-alt, http-proxy, etc. The service name is captured
 // too so the scheme decision below needs no second pass over the output.
 static RE_HTTP_PORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^(\d+)/tcp\s+open\s+(\S*http\S*)").unwrap());
-static RE_HTTP_STATUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"HTTP/\S+\s+(\d+)").unwrap());
+static RE_HTTP_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^HTTP/\S+[ \t]+(\d{3})(?:[ \t]|\r?\n|$)").unwrap());
 static RE_HTTP_SERVER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^server:\s*(.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?im)^server:[ \t]*([^\r\n]+)").unwrap());
 static RE_HTML_TITLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<title>(.*?)</title>").unwrap());
 static RE_HTTP_LOCATION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^location:\s*\S+://([^/:\s]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?im)^location:[ \t]*https?://([^/:\s]+)").unwrap());
 // Any open TCP port line, for the fingerprint pass below.
 static RE_TCP_PORT_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^(\d+)/tcp\s+open\s+\S+").unwrap());
@@ -115,13 +149,22 @@ struct PortProbe {
     /// the main header/body probe succeeded — brute-force tasks are only
     /// spawned for such ports (matching the old serial loop's `continue`)
     probe_ok: bool,
-    /// response body size in bytes, measured by curl itself
-    /// (`-w '%{size_download}'`) — the ffuf `-fs` baseline. None in fast mode
-    /// or when the size probe failed; vhost brute-forcing is skipped then
+    /// Response body byte count before UTF-8 decoding — the ffuf baseline.
+    /// None in headers-only mode.
     body_size: Option<u64>,
     /// the `Server:` response header (empty if none) — drives the feroxbuster
     /// `-x` extension list (IIS wants asp/aspx, everything else on HTB is PHP)
     server: String,
+}
+
+pub fn is_winrm_http_listener(port: u16, fingerprint: &str) -> bool {
+    // Besides the remote WSMan ports, Windows exposes a local WinRM listener
+    // on 47001 (Microsoft's "Obtaining Data from the Local Computer" docs).
+    // Accept curl's Server header and nmap's product spelling. Other servers
+    // on these ports and HTTPAPI elsewhere still get normal web enumeration.
+    let fingerprint = fingerprint.to_ascii_lowercase();
+    matches!(port, 5985 | 5986 | 47001)
+        && (fingerprint.contains("microsoft-httpapi/") || fingerprint.contains("microsoft httpapi"))
 }
 
 /// feroxbuster `-x` extensions picked from the `Server:` header. Without `-x`,
@@ -138,7 +181,99 @@ fn ferox_extensions(server: &str) -> &'static str {
     }
 }
 
-/// Probe one HTTP port: headers + body (concurrently), redirect check, vhost
+struct HttpResponse {
+    status: String,
+    server: String,
+    title: String,
+    redirect_host: Option<String>,
+    body_size: u64,
+}
+
+/// Split before decoding: lossy UTF-8 conversion must not inflate ffuf's size
+/// baseline. Header regexes never see the body (which can contain fake headers).
+fn parse_http_response(mut bytes: &[u8], headers_only: bool) -> Result<HttpResponse> {
+    loop {
+        let crlf = bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|end| (end, 4));
+        let lf = bytes
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|end| (end, 2));
+        let (end, separator) = crlf
+            .into_iter()
+            .chain(lf)
+            .min_by_key(|(end, _)| *end)
+            .ok_or_else(|| anyhow::anyhow!("HTTP response has no complete header block"))?;
+        let headers = String::from_utf8_lossy(&bytes[..end]);
+        let status = RE_HTTP_STATUS
+            .captures(&headers)
+            .map(|caps| caps[1].to_string())
+            .ok_or_else(|| anyhow::anyhow!("HTTP status missing"))?;
+        bytes = &bytes[end + separator..];
+        // curl can include interim responses before the final response.
+        if status.starts_with('1') && status != "101" {
+            continue;
+        }
+        let server = RE_HTTP_SERVER
+            .captures(&headers)
+            .map(|c| c[1].trim().to_string())
+            .unwrap_or_default();
+        let redirect_host = RE_HTTP_LOCATION
+            .captures(&headers)
+            .map(|c| c[1].to_lowercase());
+        let title = if headers_only {
+            String::new()
+        } else {
+            RE_HTML_TITLE
+                .captures(&String::from_utf8_lossy(bytes))
+                .map(|c| c[1].to_string())
+                .unwrap_or_default()
+        };
+        return Ok(HttpResponse {
+            status,
+            server,
+            title,
+            redirect_host,
+            body_size: if headers_only { 0 } else { bytes.len() as u64 },
+        });
+    }
+}
+
+fn url_host(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+async fn fetch_response(
+    curl: &str,
+    url: &str,
+    headers_only: bool,
+    connect_to: Option<&str>,
+) -> Result<HttpResponse> {
+    let mode = if headers_only { "-I" } else { "-i" };
+    let mut args = vec![
+        "-sSk",
+        "--max-time",
+        "10",
+        "--suppress-connect-headers",
+        mode,
+    ];
+    if let Some(connect_to) = connect_to {
+        // Keep the URL hostname for HTTP Host/TLS SNI, but connect to the
+        // selected box even when /etc/hosts is missing or contains an old IP.
+        args.extend(["--connect-to", connect_to]);
+    }
+    args.push(url);
+    let bytes = runner::run_cmd_bytes(curl, &args, runner::default_timeout().min(15)).await?;
+    parse_http_response(&bytes, headers_only)
+}
+
+/// Probe one HTTP port: one response per URL, redirect check, vhost
 /// comparison, whatweb fingerprinting. Failures are collected in the returned
 /// struct, never propagated — one broken port must not fail the whole phase.
 async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> PortProbe {
@@ -154,160 +289,55 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
         server: String::new(),
     };
 
-    let url = format!("{scheme}://{}:{port}", ctx.ip);
+    let target = url_host(&ctx.ip);
+    let url = format!("{scheme}://{target}:{port}");
     let vhost_url = format!("{scheme}://{}:{port}", ctx.hostname);
+    let vhost_connection = format!("{}:{port}:{target}:{port}", ctx.hostname);
 
     println!("{} Probing {}", "[*]".cyan(), url.yellow());
 
-    // grab headers + body concurrently — two independent 10s curls, so
-    // fetching them in parallel halves the per-port probe latency
-    let hdr_args = [
-        "-sk",
-        "--max-time",
-        "10",
-        "-D",
-        "-",
-        "-o",
-        "/dev/null",
-        &url,
-    ];
-    let body_args = ["-sk", "--max-time", "10", &url];
-    let (hdr_result, body_result) = tokio::join!(
-        runner::run_cmd(&ctx.curl, &hdr_args),
-        runner::run_cmd(&ctx.curl, &body_args),
-    );
-    let (hdr_output, body_output) = match (hdr_result, body_result) {
-        (Ok(headers), Ok(body)) => (headers, body),
-        (headers, body) => {
-            let detail = format!(
-                "probe {url} failed (headers: {}; body: {})",
-                headers
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "ok".to_string()),
-                body.err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "ok".to_string())
-            );
+    let (response, vhost_response) =
+        tokio::join!(fetch_response(&ctx.curl, &url, ctx.fast, None), async {
+            if ctx.fast {
+                None
+            } else {
+                Some(fetch_response(&ctx.curl, &vhost_url, false, Some(&vhost_connection)).await)
+            }
+        },);
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            let detail = format!("probe {url} failed: {e}");
             println!("{} {detail}", "[!]".yellow());
             probe.errors.push(detail);
             return probe;
         }
     };
     probe.probe_ok = true;
-
-    // measure the response size for ffuf's -fs filter with curl's own byte
-    // counter — String::len() of the lossy-decoded body miscounts non-UTF-8
-    // responses (REVIEW.md finding 13). Full mode only: fast mode never
-    // brute-forces vhosts.
     if !ctx.fast {
-        let size_args = [
-            "-sk",
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{size_download}",
-            &url,
-        ];
-        match runner::run_cmd(&ctx.curl, &size_args).await {
-            Ok(out) => match out.trim().parse::<u64>() {
-                Ok(size) => probe.body_size = Some(size),
-                Err(_) => {
-                    let detail = format!(
-                        "size probe {url} returned non-numeric output: {}",
-                        out.trim()
-                    );
-                    println!("{} {detail}", "[!]".yellow());
-                    probe.errors.push(detail);
-                }
-            },
-            Err(e) => {
-                let detail = format!("size probe {url} failed: {e}");
-                println!("{} {detail}", "[!]".yellow());
-                probe.errors.push(detail);
-            }
-        }
+        probe.body_size = Some(response.body_size);
     }
-
-    let status = RE_HTTP_STATUS
-        .captures(&hdr_output)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
-
-    let server = RE_HTTP_SERVER
-        .captures(&hdr_output)
-        .map(|c| c[1].trim().replace('\r', ""))
-        .unwrap_or_default();
+    let status = response.status;
+    let server = response.server;
+    let title = response.title;
     probe.server = server.clone();
-
-    let title = RE_HTML_TITLE
-        .captures(&body_output)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
-
-    // check for redirects to new hostnames — the /etc/hosts update itself is
-    // done by the caller (it can fail the phase, so it stays out of the task)
-    if let Some(caps) = RE_HTTP_LOCATION.captures(&hdr_output) {
-        let redir_host = caps[1].to_lowercase();
-        if redir_host != ctx.ip
-            && redir_host != ctx.hostname
-            && hosts::is_valid_hostname(&redir_host)
-        {
-            println!("{} Redirect -> {}", "[!]".yellow(), redir_host.cyan());
-            probe.lines.push(format!("  redirect -> {redir_host}"));
-            probe.redirect_hosts.push(redir_host);
-        }
+    if let Some(redir_host) = response.redirect_host
+        && redir_host != ctx.ip
+        && redir_host != ctx.hostname
+        && hosts::is_valid_hostname(&redir_host)
+    {
+        probe.lines.push(format!("  redirect -> {redir_host}"));
+        probe.redirect_hosts.push(redir_host);
     }
-
-    // compare IP vs hostname response (vhost detection)
-    let vhost_probe = if !ctx.fast {
-        let vhdr_args = [
-            "-sk",
-            "--max-time",
-            "10",
-            "-D",
-            "-",
-            "-o",
-            "/dev/null",
-            &vhost_url,
-        ];
-        let vbody_args = ["-sk", "--max-time", "10", &vhost_url];
-        let (vhdr_result, vbody_result) = tokio::join!(
-            runner::run_cmd(&ctx.curl, &vhdr_args),
-            runner::run_cmd(&ctx.curl, &vbody_args),
-        );
-        match (vhdr_result, vbody_result) {
-            (Ok(vhdr), Ok(vbody)) => {
-                let status = RE_HTTP_STATUS
-                    .captures(&vhdr)
-                    .map(|c| c[1].to_string())
-                    .unwrap_or_default();
-                let title = RE_HTML_TITLE
-                    .captures(&vbody)
-                    .map(|c| c[1].to_string())
-                    .unwrap_or_default();
-                Some((status, title))
-            }
-            (headers, body) => {
-                let detail = format!(
-                    "vhost probe {vhost_url} failed (headers: {}; body: {})",
-                    headers
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "ok".to_string()),
-                    body.err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "ok".to_string())
-                );
-                println!("{} {detail}", "[!]".yellow());
-                probe.errors.push(detail);
-                None
-            }
+    let vhost_probe = match vhost_response {
+        Some(Ok(response)) => Some((response.status, response.title)),
+        Some(Err(e)) => {
+            let detail = format!("vhost probe {vhost_url} failed: {e}");
+            println!("{} {detail}", "[!]".yellow());
+            probe.errors.push(detail);
+            None
         }
-    } else {
-        None
+        None => None,
     };
 
     let mut info = format!("  {scheme}://{}:{port}  ->  {status}", ctx.ip);
@@ -346,10 +376,25 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
 
     // tech fingerprinting — whatweb gets its own 60s timeout: hanging under the
     // 300s default it was the long-pole of the phase (REVIEW.md finding 4)
-    if runner::command_exists(&ctx.whatweb).await {
+    if !ctx.fast
+        && !is_winrm_http_listener(port, &probe.server)
+        && runner::command_exists(&ctx.whatweb).await
+    {
+        // Fingerprint the requested virtual host at the selected IP. Redirects
+        // to other hosts must not route the scan to an obsolete hosts entry.
+        let host_header = format!("Host: {}", ctx.hostname);
         match runner::run_cmd_timeout(
             &ctx.whatweb,
-            &["--no-errors", "--color=never", "-a", "3", &url],
+            &[
+                "--no-errors",
+                "--color=never",
+                "--follow-redirect=same-site",
+                "--header",
+                &host_header,
+                "-a",
+                "3",
+                &url,
+            ],
             60,
         )
         .await
@@ -371,7 +416,7 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
     probe
 }
 
-/// Is `hostname` currently resolvable via /etc/hosts?
+/// Does every hosts entry for `hostname` point to the selected target?
 ///
 /// feroxbuster and gobuster's vhost mode target the box *hostname*; when the
 /// /etc/hosts entry failed (e.g. no passwordless sudo) the name doesn't resolve
@@ -380,19 +425,32 @@ async fn probe_port(idx: usize, port: u16, scheme: &str, ctx: &ProbeCtx) -> Port
 /// such check: it already targets the IP and carries the domain in the Host
 /// header. Checked against /etc/hosts rather than a real lookup so tests stay
 /// offline.
-async fn hostname_resolvable(hostname: &str) -> bool {
+async fn hostname_resolvable(hostname: &str, ip: &str) -> bool {
     let Ok(content) = tokio::fs::read_to_string("/etc/hosts").await else {
         return false;
     };
-    content.lines().any(|line| {
+    hostname_points_to_target(&content, hostname, ip)
+}
+
+fn hostname_points_to_target(content: &str, hostname: &str, ip: &str) -> bool {
+    let mut found = false;
+    for line in content.lines() {
         let line = line.split('#').next().unwrap_or("");
-        line.split_whitespace().skip(1).any(|h| h == hostname)
-    })
+        let mut fields = line.split_whitespace();
+        let address = fields.next();
+        if fields.any(|h| h.eq_ignore_ascii_case(hostname)) {
+            if address != Some(ip) {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 
 /// Hit all HTTP ports with curl/whatweb (probes run concurrently per port).
 /// Full mode additionally kicks off feroxbuster + vhost scans in background;
-/// their raw output files land in `raw_dir` (the output dir's `raw/` subdir).
+/// their raw output files land in a fresh subdirectory under `raw_dir`.
 /// fast mode is headers-only.
 pub async fn enumerate(
     ip: &str,
@@ -401,9 +459,9 @@ pub async fn enumerate(
     raw_dir: &Path,
     report: &Report,
     scan_cfg: &ScanConfig,
-) -> Result<Vec<JoinHandle<Result<()>>>> {
+) -> Result<Vec<WebTask>> {
     let http_ports = detect_http_ports(nmap_output);
-    let mut background_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let mut background_tasks: Vec<WebTask> = Vec::new();
 
     if http_ports.is_empty() {
         println!(
@@ -426,26 +484,34 @@ pub async fn enumerate(
     let ffuf_bin = scan_cfg.tool("ffuf");
     let gobuster_bin = scan_cfg.tool("gobuster");
 
-    // Probe all ports concurrently — with several HTTP ports the strictly
+    // Probe ports concurrently — with several HTTP ports the strictly
     // serial per-port probes (curl + vhost + whatweb each) dominated this
     // phase's wall time (REVIEW.md finding 4). Results are collected and
     // processed in nmap port order below, so the report stays deterministic.
     let mut probes = JoinSet::new();
-    for (idx, (port, scheme)) in http_ports.iter().enumerate() {
-        let ctx = ProbeCtx {
-            ip: ctx.ip.clone(),
-            hostname: ctx.hostname.clone(),
-            fast: ctx.fast,
-            curl: ctx.curl.clone(),
-            whatweb: ctx.whatweb.clone(),
-        };
-        let port = *port;
-        let scheme = scheme.clone();
-        probes.spawn(async move { probe_port(idx, port, &scheme, &ctx).await });
-    }
-
+    let mut pending = http_ports.iter().enumerate();
     let mut results: Vec<PortProbe> = Vec::with_capacity(http_ports.len());
-    while let Some(res) = probes.join_next().await {
+    loop {
+        // Bound both subprocess pressure and retained HTTP bodies on hosts
+        // exposing many HTTP ports; refill as soon as any probe finishes.
+        while probes.len() < 8 {
+            let Some((idx, (port, scheme))) = pending.next() else {
+                break;
+            };
+            let ctx = ProbeCtx {
+                ip: ctx.ip.clone(),
+                hostname: ctx.hostname.clone(),
+                fast: ctx.fast,
+                curl: ctx.curl.clone(),
+                whatweb: ctx.whatweb.clone(),
+            };
+            let port = *port;
+            let scheme = scheme.clone();
+            probes.spawn(async move { probe_port(idx, port, &scheme, &ctx).await });
+        }
+        let Some(res) = probes.join_next().await else {
+            break;
+        };
         match res {
             Ok(probe) => results.push(probe),
             Err(e) => {
@@ -461,6 +527,9 @@ pub async fn enumerate(
     // add redirect hostnames to /etc/hosts — a failure here still aborts the
     // phase like in the serial version (run_scan treats it as best-effort)
     for probe in &results {
+        for hostname in &probe.redirect_hosts {
+            report.add_hostname(hostname).await;
+        }
         if !probe.redirect_hosts.is_empty() {
             hosts::add_hosts(ip, &probe.redirect_hosts).await?;
         }
@@ -482,15 +551,23 @@ pub async fn enumerate(
     // documented as "quick TCP scan + web headers", and run_scan's fast path
     // discards the returned handles (REVIEW.md finding 2)
     if !scan_cfg.fast {
+        // Every run owns fresh paths, including when a tool fails before opening
+        // its output. Previous evidence stays on disk but cannot be reused as
+        // a successful result of the current command.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let run_dir = raw_dir.join(format!("web-{}-{stamp}", std::process::id()));
+        tokio::fs::create_dir(&run_dir).await?;
         // feroxbuster/gobuster run against the box hostname; if it never made
         // it into /etc/hosts (no passwordless sudo) the name doesn't resolve
         // and both brute-forces would die on DNS errors — hit the bare IP
         // instead (REVIEW.md "Niedrig")
-        let brute_host = if hostname_resolvable(hostname).await {
+        let brute_host = if hostname_resolvable(hostname, ip).await {
             hostname.to_string()
         } else {
             println!(
-                "{} {hostname} not in /etc/hosts — brute-forcing the IP instead",
+                "{} {hostname} has no unambiguous /etc/hosts mapping to {ip} — using the IP with a Host header",
                 "[!]".yellow()
             );
             ip.to_string()
@@ -501,6 +578,14 @@ pub async fn enumerate(
             if !probe.probe_ok {
                 continue;
             }
+            if is_winrm_http_listener(probe.port, &probe.server) {
+                println!(
+                    "{} Port {}: WinRM listener -- skipping directory and vhost scans",
+                    "[*]".cyan(),
+                    probe.port
+                );
+                continue;
+            }
             let port = probe.port;
             let scheme = probe.scheme.clone();
 
@@ -508,8 +593,9 @@ pub async fn enumerate(
             if runner::command_exists(&ferox_bin).await
                 && let Some(wl) = crate::config::find_wordlist(&scan_cfg.wordlists.dir_medium)
             {
-                let ferox_out = raw_dir.join(format!("ferox-{port}.txt"));
-                let ferox_url = format!("{scheme}://{brute_host}:{port}");
+                let ferox_out = run_dir.join(format!("ferox-{port}.txt"));
+                let ferox_url = format!("{scheme}://{}:{port}", url_host(&brute_host));
+                let host_header = (brute_host != hostname).then(|| format!("Host: {hostname}"));
                 let ferox_out_str = ferox_out.to_string_lossy().to_string();
                 let ferox_threads = scan_cfg.ferox_threads;
                 let ferox_cmd = ferox_bin.clone();
@@ -518,15 +604,13 @@ pub async fn enumerate(
                     "{} feroxbuster on port {port} (background, -x {exts})...",
                     "[*]".cyan()
                 );
-                background_tasks.push(tokio::spawn(async move {
+                background_tasks.push(WebTask::spawn(ferox_out, WebResultKind::Directory, async move {
                     let threads = ferox_threads.to_string();
                     // ferox stops itself after 10m (--time-limit) and still
                     // flushes its results; the runner timeout sits 60s above
                     // that so the 300s default can't hard-kill it mid-flush
                     // (REVIEW.md finding 10)
-                    let result = runner::run_cmd_timeout(
-                        &ferox_cmd,
-                        &[
+                    let mut args = vec![
                             "-u",
                             &ferox_url,
                             "-w",
@@ -542,10 +626,11 @@ pub async fn enumerate(
                             &threads,
                             "-o",
                             &ferox_out_str,
-                        ],
-                        660,
-                    )
-                    .await;
+                        ];
+                    if let Some(host_header) = &host_header {
+                        args.extend(["-H", host_header]);
+                    }
+                    let result = runner::run_cmd_timeout(&ferox_cmd, &args, 660).await;
                     if let Err(e) = result {
                         // Killed mid-scan (usually the 660s timeout): when the
                         // output file already holds usable hits this is a
@@ -577,7 +662,7 @@ pub async fn enumerate(
             if let Some(body_size) = probe.body_size
                 && let Some(wl) = crate::config::find_wordlist(&scan_cfg.wordlists.dns_subdomains)
             {
-                let vhost_out = raw_dir.join(format!("vhosts-{port}.txt"));
+                let vhost_out = run_dir.join(format!("vhosts-{port}.txt"));
                 let vhost_out_str = vhost_out.to_string_lossy().to_string();
                 let body_size = body_size.to_string();
                 let vhost_domain = hostname.to_string();
@@ -590,36 +675,41 @@ pub async fn enumerate(
                         "{} ffuf vhost scan on port {port} (background)...",
                         "[*]".cyan()
                     );
-                    background_tasks.push(tokio::spawn(async move {
-                        let ffuf_url = format!("{scheme_owned}://{ip_owned}:{port}");
-                        let host_header = format!("Host: FUZZ.{vhost_domain}");
-                        runner::run_cmd(
-                            &ffuf_cmd,
-                            &[
-                                "-u",
-                                &ffuf_url,
-                                "-H",
-                                &host_header,
-                                "-w",
-                                &wl,
-                                "-fs",
-                                &body_size,
-                                "-mc",
-                                "all",
-                                "-fc",
-                                "400",
-                                "-t",
-                                "40",
-                                "-o",
-                                &vhost_out_str,
-                                "-of",
-                                "csv",
-                                "-noninteractive",
-                            ],
-                        )
-                        .await?;
-                        Ok(())
-                    }));
+                    background_tasks.push(WebTask::spawn(
+                        vhost_out,
+                        WebResultKind::Vhost,
+                        async move {
+                            let ffuf_url =
+                                format!("{scheme_owned}://{}:{port}", url_host(&ip_owned));
+                            let host_header = format!("Host: FUZZ.{vhost_domain}");
+                            runner::run_cmd(
+                                &ffuf_cmd,
+                                &[
+                                    "-u",
+                                    &ffuf_url,
+                                    "-H",
+                                    &host_header,
+                                    "-w",
+                                    &wl,
+                                    "-fs",
+                                    &body_size,
+                                    "-mc",
+                                    "all",
+                                    "-fc",
+                                    "400",
+                                    "-t",
+                                    "40",
+                                    "-o",
+                                    &vhost_out_str,
+                                    "-of",
+                                    "csv",
+                                    "-noninteractive",
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        },
+                    ));
                 } else if runner::command_exists(&gobuster_bin).await {
                     let host_owned = brute_host.clone();
                     let hostname_owned = hostname.to_string();
@@ -629,27 +719,32 @@ pub async fn enumerate(
                         "{} gobuster vhost scan on port {port} (background)...",
                         "[*]".cyan()
                     );
-                    background_tasks.push(tokio::spawn(async move {
-                        let gobuster_url = format!("{scheme_owned}://{host_owned}:{port}");
-                        // when the URL carries the fallback IP instead of the
-                        // hostname, gobuster can't derive the vhost domain from
-                        // it — --domain supplies it for the Host-header wordlist
-                        let mut args = vec![
-                            "vhost",
-                            "-u",
-                            gobuster_url.as_str(),
-                            "-w",
-                            wl.as_str(),
-                            "--append-domain",
-                        ];
-                        if host_owned != hostname_owned {
-                            args.push("--domain");
-                            args.push(hostname_owned.as_str());
-                        }
-                        args.extend(["-k", "-q", "-o", vhost_out_str.as_str()]);
-                        runner::run_cmd(&gobuster_cmd, &args).await?;
-                        Ok(())
-                    }));
+                    background_tasks.push(WebTask::spawn(
+                        vhost_out,
+                        WebResultKind::Vhost,
+                        async move {
+                            let gobuster_url =
+                                format!("{scheme_owned}://{}:{port}", url_host(&host_owned));
+                            // when the URL carries the fallback IP instead of the
+                            // hostname, gobuster can't derive the vhost domain from
+                            // it — --domain supplies it for the Host-header wordlist
+                            let mut args = vec![
+                                "vhost",
+                                "-u",
+                                gobuster_url.as_str(),
+                                "-w",
+                                wl.as_str(),
+                                "--append-domain",
+                            ];
+                            if host_owned != hostname_owned {
+                                args.push("--domain");
+                                args.push(hostname_owned.as_str());
+                            }
+                            args.extend(["-k", "-q", "-o", vhost_out_str.as_str()]);
+                            runner::run_cmd(&gobuster_cmd, &args).await?;
+                            Ok(())
+                        },
+                    ));
                 }
             }
         }
@@ -659,7 +754,7 @@ pub async fn enumerate(
         report.section("WEB").await;
         for line in web_info.lines() {
             if !line.is_empty() {
-                report.add(line).await;
+                report.add_service("web", line).await;
             }
         }
     }
@@ -675,6 +770,133 @@ mod tests {
     use super::{detect_http_ports, enumerate, ferox_extensions};
     use crate::config::{ScanConfig, ToolsConfig, WordlistsConfig};
     use crate::report::Report;
+
+    #[test]
+    fn parses_headers_after_status_line() {
+        let headers = "HTTP/1.1 302 Found\r\nsErVeR: Microsoft-IIS/10.0\r\nLocation: http://portal.example.htb/\r\n\r\n";
+        let server = super::RE_HTTP_SERVER.captures(headers).unwrap();
+        assert_eq!(&server[1], "Microsoft-IIS/10.0");
+        assert_eq!(ferox_extensions(&server[1]), "asp,aspx,txt,html");
+        assert_eq!(
+            &super::RE_HTTP_LOCATION.captures(headers).unwrap()[1],
+            "portal.example.htb"
+        );
+        assert!(
+            super::RE_HTTP_SERVER
+                .captures("HTTP/1.1 200 OK\r\nServer:\r\nOther: value\r\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn combined_response_preserves_byte_count_and_final_headers() {
+        let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n\xff\xfe\nServer: fake\n";
+        let response = super::parse_http_response(bytes, false).unwrap();
+        assert_eq!(response.status, "200");
+        assert_eq!(response.server, "nginx");
+        assert_eq!(response.body_size, b"\xff\xfe\nServer: fake\n".len() as u64);
+        let response = super::parse_http_response(b"HTTP/1.1 200 OK\r\n\r\n", true).unwrap();
+        assert_eq!(response.body_size, 0);
+        assert!(response.title.is_empty());
+        let response =
+            super::parse_http_response(b"HTTP/1.1 200 OK\n\nServer: fake\r\n\r\nbody", false)
+                .unwrap();
+        assert!(response.server.is_empty());
+        assert_eq!(response.body_size, b"Server: fake\r\n\r\nbody".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn fast_probe_uses_one_head_request_and_no_whatweb() {
+        let tmp = TmpDir::new("web_fast_head");
+        let cfg = stub_scan_cfg(true, tmp.path());
+        let log = tmp.path().join("calls");
+        std::fs::write(
+            &cfg.tools.curl,
+            format!(
+                r#"#!/bin/sh
+printf 'call\n' >> '{}'
+for arg; do if [ "$arg" = '-I' ]; then
+    printf 'HTTP/1.1 200 OK\r\nServer: test\r\n\r\n'
+    exit 0
+fi; done
+exit 2
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let ctx = super::ProbeCtx {
+            ip: "192.0.2.1".into(),
+            hostname: "test.htb".into(),
+            fast: true,
+            curl: cfg.tools.curl,
+            whatweb: "/bin/false".into(),
+        };
+        let probe = super::probe_port(0, 80, "http", &ctx).await;
+        assert!(probe.probe_ok);
+        assert!(probe.errors.is_empty(), "{:?}", probe.errors);
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "call\n");
+        assert_eq!(probe.body_size, None);
+    }
+
+    #[test]
+    fn host_mapping_rejects_old_or_ambiguous_addresses() {
+        let current = "  10.129.57.241 FIREFLOW.HTB # current box\n";
+        assert!(super::hostname_points_to_target(
+            current,
+            "fireflow.htb",
+            "10.129.57.241"
+        ));
+        assert!(!super::hostname_points_to_target(
+            "10.129.1.1 fireflow.htb\n",
+            "fireflow.htb",
+            "10.129.57.241"
+        ));
+        assert!(!super::hostname_points_to_target(
+            &format!("10.129.1.1 fireflow.htb\n{current}"),
+            "fireflow.htb",
+            "10.129.57.241"
+        ));
+        assert!(!super::hostname_points_to_target(
+            "# 10.129.57.241 fireflow.htb\n",
+            "fireflow.htb",
+            "10.129.57.241"
+        ));
+    }
+
+    #[tokio::test]
+    async fn vhost_probe_pins_connection_to_selected_box() {
+        let tmp = TmpDir::new("web_pinned_vhost");
+        let cfg = stub_scan_cfg(false, tmp.path());
+        std::fs::write(
+            &cfg.tools.curl,
+            r#"#!/bin/sh
+pinned=false
+vhost=false
+for arg; do
+  [ "$arg" = 'unresolved.htb:8443:192.0.2.1:8443' ] && pinned=true
+  [ "$arg" = 'https://unresolved.htb:8443' ] && vhost=true
+done
+if $vhost; then
+  $pinned || exit 6
+  printf 'HTTP/1.1 200 OK\r\n\r\n<title>Selected box</title>'
+else
+  printf 'HTTP/1.1 301 Moved\r\n\r\n'
+fi
+"#,
+        )
+        .unwrap();
+        let ctx = super::ProbeCtx {
+            ip: "192.0.2.1".into(),
+            hostname: "unresolved.htb".into(),
+            fast: false,
+            curl: cfg.tools.curl,
+            whatweb: cfg.tools.whatweb,
+        };
+        let probe = super::probe_port(0, 8443, "https", &ctx).await;
+        assert!(probe.errors.is_empty(), "{:?}", probe.errors);
+        assert!(probe.lines.iter().any(|line| line.contains("Selected box")));
+    }
 
     #[test]
     fn detects_http_https_and_variants() {
@@ -755,7 +977,14 @@ Service Info: OS: Linux";
         let curl_stub = tmp.join("curl-stub.sh");
         std::fs::write(
             &curl_stub,
-            "#!/bin/sh\nfor last; do :; done\nport=${last##*:}\nprintf 'HTTP/1.1 200 OK\\r\\nServer: stub\\r\\n\\r\\n<title>stub-%s</title>\\n' \"$port\"\n",
+            r#"#!/bin/sh
+head=false
+for arg; do [ "$arg" = '-I' ] && head=true; done
+for last; do :; done
+port=${last##*:}
+printf 'HTTP/1.1 200 OK\r\nServer: stub-%s\r\n\r\n' "$port"
+if [ "$head" = false ]; then printf '<title>stub-%s</title>\n' "$port"; fi
+"#,
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -835,8 +1064,51 @@ Service Info: OS: Linux";
         .await
         .unwrap();
         assert_eq!(tasks.len(), 1, "full mode spawns the feroxbuster task");
-        for task in tasks {
-            task.await.unwrap().unwrap();
+        for mut task in tasks {
+            (&mut task.handle).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn winrm_skips_web_brutes_but_keeps_headers_and_other_websites() {
+        for (port, server, expected_tasks) in [
+            (5985, "Microsoft-HTTPAPI/2.0", 0),
+            (5986, "microsoft-httpapi/2.0", 0),
+            (47001, "Microsoft-HTTPAPI/2.0", 0),
+            (8080, "Microsoft-HTTPAPI/2.0", 1),
+            (5985, "Microsoft-IIS/10.0", 1),
+            (47001, "Microsoft-IIS/10.0", 1),
+        ] {
+            let tmp = TmpDir::new("web_winrm");
+            let mut cfg = stub_scan_cfg(false, tmp.path());
+            std::fs::write(
+                &cfg.tools.curl,
+                format!(
+                    "#!/bin/sh\nprintf 'HTTP/1.1 404 Not Found\\r\\nServer: {server}\\r\\n\\r\\n'\n"
+                ),
+            )
+            .unwrap();
+            // Any unwanted WhatWeb invocation would become a report error.
+            if expected_tasks == 0 {
+                cfg.tools.whatweb = "/bin/false".into();
+            }
+            let report = Report::new();
+            let nmap = format!("{port}/tcp open http");
+            let tasks = enumerate("127.0.0.1", "testbox.htb", &nmap, tmp.path(), &report, &cfg)
+                .await
+                .unwrap();
+            assert_eq!(tasks.len(), expected_tasks, "{server} on {port}");
+            for mut task in tasks {
+                (&mut task.handle).await.unwrap().unwrap();
+            }
+            assert!(report.errors().await.is_empty());
+            assert!(
+                report
+                    .lines()
+                    .await
+                    .iter()
+                    .any(|line| line.contains(server))
+            );
         }
     }
 
@@ -854,8 +1126,8 @@ Service Info: OS: Linux";
             .await
             .unwrap();
         assert_eq!(tasks.len(), 2, "one feroxbuster task per port");
-        for task in tasks {
-            task.await.unwrap().unwrap();
+        for mut task in tasks {
+            (&mut task.handle).await.unwrap().unwrap();
         }
 
         let out = tmp.path().join("report.txt");
@@ -915,9 +1187,10 @@ exit 1
         assert_eq!(tasks.len(), 1);
         // failed process, but hits on disk -> task reports success (the join
         // loop in run_scan therefore records no error)
-        tasks.into_iter().next().unwrap().await.unwrap().unwrap();
+        let mut task = tasks.into_iter().next().unwrap();
+        (&mut task.handle).await.unwrap().unwrap();
         // and the partial results file is there for process_ferox_results
-        let ferox_out = std::fs::read_to_string(tmp.path().join("ferox-8080.txt")).unwrap();
+        let ferox_out = std::fs::read_to_string(&task.output).unwrap();
         assert!(ferox_out.contains("/admin"));
 
         // same failure with NO hits on disk -> the error still propagates
@@ -934,7 +1207,45 @@ exit 1
         .await
         .unwrap();
         assert_eq!(tasks.len(), 1);
-        assert!(tasks.into_iter().next().unwrap().await.unwrap().is_err());
+        let mut task = tasks.into_iter().next().unwrap();
+        assert!((&mut task.handle).await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_scan_cannot_reuse_old_results_on_failure() {
+        let tmp = TmpDir::new("web_repeat");
+        let cfg = stub_scan_cfg_with_ferox(tmp.path(), FEROX_STUB_PARTIAL);
+        let mut first = enumerate(
+            "127.0.0.1",
+            "testbox.htb",
+            "8080/tcp open http",
+            tmp.path(),
+            &Report::new(),
+            &cfg,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        (&mut first.handle).await.unwrap().unwrap();
+        let cfg = stub_scan_cfg_with_ferox(tmp.path(), FEROX_STUB_NO_HITS);
+        let mut second = enumerate(
+            "127.0.0.1",
+            "testbox.htb",
+            "8080/tcp open http",
+            tmp.path(),
+            &Report::new(),
+            &cfg,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert!((&mut second.handle).await.unwrap().is_err());
+        assert_ne!(first.output, second.output);
+        assert!(first.output.exists(), "previous evidence is preserved");
+        assert!(
+            !second.output.exists(),
+            "failed command has no current evidence"
+        );
     }
 
     /// Throwaway directory under the system temp dir, removed on drop.

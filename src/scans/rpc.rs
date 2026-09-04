@@ -21,12 +21,12 @@ pub async fn enumerate(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Resu
         if success {
             println!("{} RPC null session successful!", "[+]".green());
             println!("{output}");
-            report.add(&output).await;
+            report.add_service("rpc", &output).await;
         } else if output.contains("NT_STATUS_ACCESS_DENIED")
             || output.contains("NT_STATUS_LOGON_FAILURE")
         {
             println!("{} RPC null session denied", "[!]".yellow());
-            report.add("  (null session denied)").await;
+            report.add_service("rpc", "  (null session denied)").await;
         } else {
             bail!("rpcclient failed: {}", output.trim());
         }
@@ -50,7 +50,7 @@ pub async fn enumerate(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Resu
         if !filtered.is_empty() {
             let text = filtered.join("\n");
             println!("{text}");
-            report.add(&text).await;
+            report.add_service("rpc", &text).await;
         }
     }
 

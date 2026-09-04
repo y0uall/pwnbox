@@ -21,7 +21,9 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
             "{} psql not found — skipping PostgreSQL check",
             "[!]".yellow()
         );
-        report.add("  (psql not installed)").await;
+        report
+            .add_service("postgres", "  (psql not installed)")
+            .await;
         return Ok(());
     }
 
@@ -97,8 +99,10 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
         let lines: Vec<&str> = output.lines().take(20).collect();
         let text = lines.join("\n");
         println!("{text}");
-        report.add(&format!("  Login: YES ({cred_display})")).await;
-        report.add(&text).await;
+        report
+            .add_service("postgres", &format!("  Login: YES ({cred_display})"))
+            .await;
+        report.add_service("postgres", &text).await;
         report
             .add_vuln(&format!("PostgreSQL: default credentials {cred_display}"))
             .await;
@@ -110,6 +114,8 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
     }
 
     println!("{} All default credentials denied", "[!]".yellow());
-    report.add("  Default credentials: NO").await;
+    report
+        .add_service("postgres", "  Default credentials: NO")
+        .await;
     Ok(())
 }

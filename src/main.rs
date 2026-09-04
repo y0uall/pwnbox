@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -657,6 +657,11 @@ type LdapTask = JoinHandle<Result<(Report, Option<String>)>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some(runner::SUDO_WORKER_FLAG) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = runner::sudo_worker(&args).await?;
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
 
     // --init-config: dump a default config and bail
@@ -892,7 +897,12 @@ async fn run_scan(
     // --- Phase 0: ping check + OS guess from TTL ---
     let t = Instant::now();
     phase_header("[0/6]", "Connectivity check...");
-    let os_guess = scans::connectivity::check(&cfg.ip, &report).await?;
+    let os_guess = if scan_cfg.should_skip("connectivity") {
+        println!("{} Connectivity check skipped", "[*]".dimmed());
+        "unknown (connectivity skipped)".to_string()
+    } else {
+        scans::connectivity::check(&cfg.ip, &report).await?
+    };
     {
         let mut json = report.json_mut().await;
         json.os_guess = os_guess.clone();
@@ -929,7 +939,10 @@ async fn run_scan(
     phase_header("[2/6]", "TCP port discovery...");
     // TCP is a core phase, but a failure here must not kill the whole report —
     // record the error and continue with empty port data, same as DNS above.
-    let nmap_output =
+    let nmap_output = if scan_cfg.should_skip("tcp") {
+        println!("{} TCP scan skipped", "[*]".dimmed());
+        String::new()
+    } else {
         match scans::tcp::scan(&cfg.ip, &raw_dir, &report, cli.resume, &scan_cfg).await {
             Ok(output) => output,
             Err(e) => {
@@ -937,7 +950,8 @@ async fn run_scan(
                 report.add_error("TCP", &e.to_string()).await;
                 String::new()
             }
-        };
+        }
+    };
 
     // pull hostnames from nmap output (SSL certs, redirects, etc.) — best-effort
     let nmap_hosts = match scans::tcp::extract_hostnames(&nmap_output, &cfg.ip).await {
@@ -1055,7 +1069,7 @@ async fn run_scan(
         );
 
         // still dump a summary + write the report
-        print_summary(&cfg, &nmap_output, "", &os_guess, &report).await;
+        print_summary(&cfg, &nmap_output, "", &os_guess, &[], &report).await;
         report.write_to_file(&cfg.report_path).await?;
         let json_path = if cli.json {
             let p = cfg.report_path.with_extension("json");
@@ -1099,39 +1113,23 @@ async fn run_scan(
         None
     };
 
-    // --- Phase 4: Web enumeration ---
-    let web_bg_tasks = if !scan_cfg.should_skip("web") {
-        let t = Instant::now();
-        phase_header("[4/6]", "Web enumeration...");
-        let tasks = match scans::web::enumerate(
-            &cfg.ip,
-            &cfg.hostname,
-            &nmap_output,
-            &raw_dir,
-            &report,
-            &scan_cfg,
-        )
-        .await
-        {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                // best-effort like the other phases: record the failure and
-                // continue with no background tasks instead of aborting the scan
-                println!("{} Web enumeration failed: {e}", "[!]".yellow());
-                report.add_error("WEB", &e.to_string()).await;
-                Vec::new()
-            }
-        };
-        // feroxbuster/vhost scans are spawned inside web::enumerate — register
-        // their abort handles so the signal path can still stop them
-        for task in &tasks {
-            registry.track(task);
-        }
-        phase_done(t);
-        tasks
+    // Web probing and service enumeration are independent after TCP discovery.
+    // Keep an isolated report while they overlap, then merge in phase order.
+    let web_handle = if !scan_cfg.should_skip("web") {
+        phase_header("[4/6]", "Web enumeration (parallel with services)...");
+        let ip = cfg.ip.clone();
+        let hostname = cfg.hostname.clone();
+        let nmap = nmap_output.clone();
+        let rd = raw_dir.clone();
+        let sc = scan_cfg.clone();
+        Some(registry.spawn(async move {
+            let tr = Report::new();
+            let result = scans::web::enumerate(&ip, &hostname, &nmap, &rd, &tr, &sc).await;
+            (tr, result)
+        }))
     } else {
         println!("\n{} Web enumeration skipped", "[*]".dimmed());
-        Vec::new()
+        None
     };
 
     // --- Phase 5: service-specific scans (all run in parallel) ---
@@ -1369,8 +1367,38 @@ async fn run_scan(
         None
     };
 
-    // join LDAP right away (the service tasks above keep running meanwhile)
-    // and start Kerberos immediately, so it overlaps with phase 5 + UDP
+    // All service tasks (including LDAP) have started before waiting for Web.
+    let web_bg_tasks = if let Some(handle) = web_handle {
+        match handle.await {
+            Ok((tr, result)) => {
+                report.merge_from(&tr).await;
+                match result {
+                    Ok(tasks) => {
+                        for task in &tasks {
+                            registry.track(&task.handle);
+                        }
+                        tasks
+                    }
+                    Err(e) => {
+                        println!("{} Web enumeration failed: {e}", "[!]".yellow());
+                        report.add_error("WEB", &e.to_string()).await;
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                report
+                    .add_error("WEB", &format!("probe task failed: {e}"))
+                    .await;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Collect LDAP after the web report, then start Kerberos while the other
+    // service tasks and UDP continue in the background.
     let mut ldap_domain: Option<String> = None;
     if let Some(handle) = ldap_handle {
         match handle.await {
@@ -1516,6 +1544,8 @@ async fn run_scan(
         }
     }
 
+    // Keep the same current-run file list for parsing and the final summary.
+    let mut web_files = Vec::new();
     // wait for feroxbuster / vhost scans to wrap up
     if !web_bg_tasks.is_empty() {
         println!(
@@ -1524,8 +1554,10 @@ async fn run_scan(
             web_bg_tasks.len()
         );
         let mut web_failures = 0usize;
-        for task in web_bg_tasks {
-            match task.await {
+        let mut ferox_files = Vec::new();
+        let mut vhost_files = Vec::new();
+        for mut task in web_bg_tasks {
+            match (&mut task.handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     web_failures += 1;
@@ -1540,6 +1572,11 @@ async fn run_scan(
                         .await;
                 }
             }
+            match task.kind {
+                scans::web::WebResultKind::Directory => ferox_files.push(task.output.clone()),
+                scans::web::WebResultKind::Vhost => vhost_files.push(task.output.clone()),
+            }
+            web_files.push((task.kind, task.output.clone()));
         }
         if web_failures == 0 {
             println!("{} Web background tasks complete", "[+]".green());
@@ -1550,8 +1587,8 @@ async fn run_scan(
             );
         }
 
-        process_ferox_results(&cfg, &report).await;
-        process_vhost_results(&cfg, &report).await;
+        process_ferox_results(&ferox_files, &report).await;
+        process_vhost_results(&cfg, &vhost_files, &report).await;
     }
 
     // wait for vuln scan
@@ -1576,7 +1613,15 @@ async fn run_scan(
     }
 
     // all done, print the summary and write reports
-    print_summary(&cfg, &nmap_output, &udp_output, &os_guess, &report).await;
+    print_summary(
+        &cfg,
+        &nmap_output,
+        &udp_output,
+        &os_guess,
+        &web_files,
+        &report,
+    )
+    .await;
     report.write_to_file(&cfg.report_path).await?;
 
     let json_path = if cli.json {
@@ -1603,7 +1648,12 @@ async fn run_scan(
     );
 
     // watch mode: keep re-scanning and alert on port changes
-    if let Some(interval_mins) = cli.watch {
+    if cli.watch.is_some() && scan_cfg.should_skip("tcp") {
+        println!(
+            "{} Watch mode skipped because TCP scanning is disabled",
+            "[!]".yellow()
+        );
+    } else if let Some(interval_mins) = cli.watch {
         let interval = std::cmp::max(interval_mins, 1);
         println!(
             "\n{} Watch mode: re-scanning every {} minute(s). Press Ctrl+C to stop.",
@@ -1727,37 +1777,11 @@ fn colorize_ferox_line(line: &str) -> String {
 }
 
 /// Clean up feroxbuster output: strip config noise, keep actual findings.
-/// The raw files live in the output dir's `raw/` subdirectory.
-async fn process_ferox_results(cfg: &BoxConfig, report: &Report) {
+/// Only paths produced by this run are passed in, including partial results.
+async fn process_ferox_results(paths: &[PathBuf], report: &Report) {
     let mut found_any = false;
 
-    let mut entries = match tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
-        Ok(e) => e,
-        Err(e) => {
-            report.add_error("DIR BRUTE", &e.to_string()).await;
-            return;
-        }
-    };
-
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(e) => {
-                report
-                    .add_error(
-                        "DIR BRUTE",
-                        &format!("result directory iteration failed: {e}"),
-                    )
-                    .await;
-                break;
-            }
-        };
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with("ferox-") || !name.ends_with(".txt") {
-            continue;
-        }
+    for path in paths {
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
             Err(e) => {
@@ -1833,34 +1857,11 @@ fn normalize_vhost_candidate(candidate: &str, base_domain: &str) -> Option<Strin
 }
 
 /// Parse vhost scan results (ffuf CSV or gobuster format) and add to /etc/hosts.
-/// The raw files live in the output dir's `raw/` subdirectory.
-async fn process_vhost_results(cfg: &BoxConfig, report: &Report) {
+/// Only paths produced by this run are passed in, including partial results.
+async fn process_vhost_results(cfg: &BoxConfig, paths: &[PathBuf], report: &Report) {
     let mut found_any = false;
 
-    let mut entries = match tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
-        Ok(e) => e,
-        Err(e) => {
-            report.add_error("VHOSTS", &e.to_string()).await;
-            return;
-        }
-    };
-
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(e) => {
-                report
-                    .add_error("VHOSTS", &format!("result directory iteration failed: {e}"))
-                    .await;
-                break;
-            }
-        };
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with("vhosts-") || !name.ends_with(".txt") {
-            continue;
-        }
+    for path in paths {
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
             Err(e) => {
@@ -1932,6 +1933,7 @@ async fn print_summary(
     nmap_output: &str,
     udp_output: &str,
     os_guess: &str,
+    web_files: &[(scans::web::WebResultKind, PathBuf)],
     report: &Report,
 ) {
     println!();
@@ -1982,23 +1984,17 @@ async fn print_summary(
             nmap_udp.display().to_string().yellow()
         );
     }
-    if let Ok(mut entries) = tokio::fs::read_dir(cfg.output_dir.join("raw")).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("ferox-") && name.ends_with(".txt") {
-                println!(
-                    "  {} {}",
-                    "Ferox".dimmed(),
-                    entry.path().display().to_string().yellow()
-                );
-            } else if name.starts_with("vhosts-") && name.ends_with(".txt") {
-                println!(
-                    "  {} {}",
-                    "Vhosts".dimmed(),
-                    entry.path().display().to_string().yellow()
-                );
-            }
+    for (kind, path) in web_files {
+        if path.exists() {
+            let label = match kind {
+                scans::web::WebResultKind::Directory => "Ferox",
+                scans::web::WebResultKind::Vhost => "Vhosts",
+            };
+            println!(
+                "  {} {}",
+                label.dimmed(),
+                path.display().to_string().yellow()
+            );
         }
     }
 
@@ -2006,6 +2002,11 @@ async fn print_summary(
     let mut next_steps: Vec<String> = Vec::new();
     let all_ports = extract_open_ports(nmap_output, udp_output);
     let http_ports = scans::web::detect_http_ports(nmap_output);
+    let local_winrm = parse_port_entries(nmap_output)
+        .iter()
+        .any(|(port, _, _, _, version)| {
+            *port == 47001 && scans::web::is_winrm_http_listener(*port, version)
+        });
     for port in &all_ports {
         let step = match *port {
             21 => Some("FTP(21): check anonymous login, upload/download files"),
@@ -2035,6 +2036,9 @@ async fn print_summary(
             8443 => Some("HTTPS(8443): check cert, admin panels, API endpoints"),
             8000 | 8888 | 9090 => Some("Web-Alt: check for admin panels, APIs, dev servers"),
             27017 => Some("MongoDB(27017): mongosh --host, check no-auth"),
+            47001 if local_winrm => {
+                Some("WinRM(47001): local management listener; use 5985/5986 for remote access")
+            }
             _ => None,
         };
         // HTTP ports on non-standard ports (e.g. fingerprint-detected 6274)
@@ -2405,6 +2409,26 @@ PORT     STATE         SERVICE
 
         assert!(report_path.exists());
         assert!(!report_path.with_extension("json").exists());
+    }
+
+    #[tokio::test]
+    async fn directory_results_exclude_old_runs_and_keep_current_partial_output() {
+        let tmp = TmpDir::new("current_web_results");
+        let old = tmp.path().join("ferox-80.txt");
+        let current_dir = tmp.path().join("web-current");
+        std::fs::create_dir(&current_dir).unwrap();
+        let current = current_dir.join("ferox-80.txt");
+        std::fs::write(&old, "200 GET 1l 1w 1c http://test.htb/stale\n").unwrap();
+        std::fs::write(&current, "200 GET 1l 1w 1c http://test.htb/current\n").unwrap();
+        let report = Report::new();
+        process_ferox_results(&[current], &report).await;
+        let lines = report.lines().await.join("\n");
+        assert!(lines.contains("http://test.htb/current"));
+        assert!(!lines.contains("stale"));
+        assert!(old.exists());
+        let json = report.json_mut().await;
+        assert_eq!(json.services["web"].len(), 1);
+        assert!(json.services["web"][0].contains("/current"));
     }
 
     // ── TaskRegistry (REVIEW.md finding 3) ────────────────────────

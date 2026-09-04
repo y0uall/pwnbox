@@ -25,6 +25,13 @@ fn ldap_endpoint(ip: &str, port: u16) -> String {
     format!("{scheme}://{host}:{port}")
 }
 
+fn anonymous_access_denied(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("invalid credentials")
+        || lower.contains("insufficient access")
+        || lower.contains("a successful bind must be completed")
+}
+
 /// Try anonymous LDAP bind, pull out the domain if we can.
 pub async fn enumerate(
     ip: &str,
@@ -61,13 +68,11 @@ pub async fn enumerate(
     .await?;
 
     if !success {
-        let lower = output.to_lowercase();
-        if lower.contains("operations error")
-            || lower.contains("invalid credentials")
-            || lower.contains("insufficient access")
-        {
+        if anonymous_access_denied(&output) {
             println!("{} Anonymous bind denied", "[!]".yellow());
-            report.add("  (anonymous bind denied)").await;
+            report
+                .add_service("ldap", "  (anonymous bind denied)")
+                .await;
             return Ok(None);
         }
         bail!("ldapsearch failed for {endpoint}: {}", output.trim());
@@ -105,7 +110,10 @@ pub async fn enumerate(
         if !parts.is_empty() {
             let dom = parts.join(".");
             println!("{} Domain: {}", "[+]".green(), dom.cyan());
-            report.add(&format!("  Domain: {dom}")).await;
+            report
+                .add_service("ldap", &format!("  Domain: {dom}"))
+                .await;
+            report.add_hostname(&dom).await;
             hosts::add_hosts(ip, std::slice::from_ref(&dom)).await?;
             domain = Some(dom);
         }
@@ -190,10 +198,6 @@ async fn dump_directory(
         }
     };
 
-    if !success && output.trim().is_empty() {
-        return;
-    }
-
     // keep the full dump so the operator can grep it later
     let path = raw_dir.join("ldap-users.txt");
     if let Err(e) = tokio::fs::write(&path, &output).await {
@@ -203,11 +207,38 @@ async fn dump_directory(
     }
 
     let (users, secrets) = parse_ldap_entries(&output);
+    if !success {
+        // AD allows RootDSE discovery while denying the subsequent subtree
+        // search. That is not evidence of an empty directory. Keep partial
+        // entries from other failures (e.g. a size limit), alongside the error.
+        if anonymous_access_denied(&output) {
+            println!(
+                "{} Anonymous directory read denied -- credentials required",
+                "[!]".yellow()
+            );
+            report
+                .add_service(
+                    "ldap",
+                    "  (anonymous directory read denied -- credentials required)",
+                )
+                .await;
+        } else {
+            let detail = format!("anonymous directory search failed: {}", output.trim());
+            println!("{} {detail}", "[!]".yellow());
+            report.add_error("LDAP", &detail).await;
+        }
+        if users.is_empty() && secrets.is_empty() {
+            return;
+        }
+    }
     if users.is_empty() && secrets.is_empty() {
         println!(
             "{} Anonymous subtree returned no person objects",
             "[!]".yellow()
         );
+        report
+            .add_service("ldap", "  (anonymous search returned no person objects)")
+            .await;
         return;
     }
 
@@ -254,6 +285,22 @@ mod tests {
     fn endpoint_uses_ldaps_and_brackets_ipv6() {
         assert_eq!(ldap_endpoint("10.10.10.10", 636), "ldaps://10.10.10.10:636");
         assert_eq!(ldap_endpoint("::1", 636), "ldaps://[::1]:636");
+    }
+
+    #[test]
+    fn distinguishes_ad_bind_requirement_from_empty_search_and_other_errors() {
+        let denied = "result: 1 Operations error\n\
+text: 000004DC: LdapErr: DSID-0C090DAB, comment: In order to perform this opera\n\
+ tion a successful bind must be completed on the connection., data 0, v65f4\n";
+        assert!(anonymous_access_denied(denied));
+        assert!(anonymous_access_denied("result: 50 Insufficient access"));
+        assert!(!anonymous_access_denied(
+            "result: 0 Success\n# numResponses: 1"
+        ));
+        assert!(!anonymous_access_denied(
+            "result: 1 Operations error\ntext: backend unavailable"
+        ));
+        assert!(!anonymous_access_denied("result: 4 Size limit exceeded"));
     }
 
     #[test]

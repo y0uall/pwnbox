@@ -15,7 +15,9 @@ pub async fn enumerate(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Resu
             "{} showmount not found -- skipping NFS enum",
             "[!]".yellow()
         );
-        report.add("  (showmount not installed)").await;
+        report
+            .add_service("nfs", "  (showmount not installed)")
+            .await;
         return Ok(());
     }
 
@@ -34,10 +36,10 @@ pub async fn enumerate(ip: &str, scan_cfg: &ScanConfig, report: &Report) -> Resu
         println!("{} NFS exports found!", "[+]".green());
         let text = exports.join("\n");
         println!("{text}");
-        report.add(&text).await;
+        report.add_service("nfs", &text).await;
     } else {
         println!("{} No NFS exports", "[!]".yellow());
-        report.add("  (no exports)").await;
+        report.add_service("nfs", "  (no exports)").await;
     }
 
     Ok(())

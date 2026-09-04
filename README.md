@@ -38,11 +38,11 @@ Everything gets collected into a **text report**, an optional **JSON report**, a
 ## Features
 
 - **14 service modules** with automatic detection based on open ports
-- **Parallel execution** via tokio — service scans, dir brute, vhost scan all run concurrently
+- **Parallel execution** via tokio — web probes overlap with service scans, with up to 8 web ports and 16 external commands active at once
 - **Default credential testing** for MySQL, PostgreSQL, Redis, MSSQL, FTP
 - **SSL cert hostname discovery** — extracts CN/SAN from HTTPS certs
-- **Auto /etc/hosts** — discovered hostnames are added automatically
-- **`--fast` mode** — TCP + web headers only, done in under a minute
+- **Auto /etc/hosts** — discovered hostnames are added automatically; aliases from previous box IPs are moved to the current target
+- **`--fast` mode** — TCP + one HTTP HEAD request per web port; skips body downloads, WhatWeb and deep enumeration
 - **`--resume`** — reuse cached nmap output on re-runs
 - **`--watch N`** — re-scan ports every N minutes, alert on changes
 - **Config-driven** — wordlists, tool paths, timeouts all in `config.toml`
@@ -132,9 +132,14 @@ Reports are saved to `~/htb/<boxname>/`:
     nmap-tcp.txt                raw nmap TCP output
     nmap-udp.txt                raw nmap UDP output
     nmap-vuln.txt               vuln scan output
-    ferox-80.txt                directory brute results
-    vhosts-443.txt              virtual host discoveries
+    web-<pid>-<timestamp>/      fresh directory for each web scan
+      ferox-80.txt              directory brute results
+      vhosts-443.txt            virtual host discoveries
 ```
+
+Web findings come only from the current run's files, including partial results
+from interrupted tools. Earlier raw files remain available for inspection;
+`--resume` reuses the nmap cache.
 
 ## Configuration
 

@@ -16,7 +16,9 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
     if !banner.is_empty() {
         let first = banner.lines().next().unwrap_or("");
         println!("{} Banner: {}", "[+]".green(), first.cyan());
-        report.add(&format!("  Banner: {first}")).await;
+        report
+            .add_service("smtp", &format!("  Banner: {first}"))
+            .await;
     }
 
     // check if VRFY is enabled (user enumeration). The probe pipelines
@@ -34,10 +36,14 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
             "{} VRFY command supported — user enumeration possible",
             "[+]".green()
         );
-        report.add("  VRFY: supported (user enum possible)").await;
+        report
+            .add_service("smtp", "  VRFY: supported (user enum possible)")
+            .await;
     } else {
         println!("{} VRFY disabled or restricted", "[!]".yellow());
-        report.add("  VRFY: disabled/restricted").await;
+        report
+            .add_service("smtp", "  VRFY: disabled/restricted")
+            .await;
     }
 
     // EXPN (mailing list expansion) — same pipelining, so read the EXPN reply
@@ -46,7 +52,7 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
 
     if matches!(command_reply(&expn, 2), Some(250 | 251)) {
         println!("{} EXPN command supported", "[+]".green());
-        report.add("  EXPN: supported").await;
+        report.add_service("smtp", "  EXPN: supported").await;
     }
 
     // automated user enumeration if the tool is installed
@@ -86,10 +92,12 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
 
         if !users.is_empty() {
             println!("{} Found {} valid user(s)!", "[+]".green(), users.len());
-            report.add(&format!("  Users found: {}", users.len())).await;
+            report
+                .add_service("smtp", &format!("  Users found: {}", users.len()))
+                .await;
             for u in &users {
                 println!("    {}", u.cyan());
-                report.add(&format!("    {u}")).await;
+                report.add_service("smtp", &format!("    {u}")).await;
             }
         } else {
             println!("{} No users found via VRFY", "[!]".yellow());
@@ -111,7 +119,9 @@ pub async fn check(ip: &str, port: u16, scan_cfg: &ScanConfig, report: &Report) 
 
     if command_reply(&relay, 3) == Some(250) {
         println!("{} Possible OPEN RELAY detected!", "[+]".green().bold());
-        report.add("  *** OPEN RELAY DETECTED ***").await;
+        report
+            .add_service("smtp", "  *** OPEN RELAY DETECTED ***")
+            .await;
     }
 
     Ok(())

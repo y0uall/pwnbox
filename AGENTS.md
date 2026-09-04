@@ -59,14 +59,27 @@ The pipeline in `run_scan` (`src/main.rs`) runs phases 0–5:
    subdirectory). A background
    `nmap --script vuln` task is spawned (`tcp::vuln_scan`). SSL cert CN/SAN
    hostnames are harvested via an openssl pipeline.
+   Vulnerability-script results retain port/script/title context, deduplicate
+   CVEs and are labeled unverified in both text and JSON; a scanner verdict is
+   not independent confirmation of exploitability.
 3. **UDP** — `scans/udp.rs`: `sudo nmap -sU --top-ports 100 -sV`, spawned in
    the background, joined after phase 5.
 4. **Web** — `scans/web.rs`: per-HTTP-port probes (curl headers/body, vhost
-   compare, whatweb with a 60s timeout) run concurrently in a `JoinSet` and are
+   compare, whatweb with a 60s timeout) run concurrently in a `JoinSet` (up to
+   eight ports at once), overlapping with service enumeration, and are
    written to the report in nmap port order; then background feroxbuster
    (`--time-limit 10m` + 660s runner timeout; partial results on disk survive a
-   kill) and ffuf/gobuster (vhost brute) tasks. Returns `Vec<JoinHandle>` to
-   the caller.
+   kill) and ffuf/gobuster (vhost brute) tasks. Returns `Vec<WebTask>` to the
+   caller, pairing each handle with its exact output path. Each full web run
+   uses a fresh `raw/web-<pid>-<timestamp>/` directory; post-processing and the
+   summary use only that run's task paths. Fast mode makes one HEAD request per
+   web port and skips body downloads, WhatWeb and brute-force tasks.
+   Curl vhost comparisons pin the connection to the target with `--connect-to`.
+   Feroxbuster uses hostnames only when their hosts-file mappings all match the
+   target; otherwise it sends the Host header to the target IP. WhatWeb uses
+   the target IP and Host header, with redirects limited to the same site.
+   Microsoft-HTTPAPI on WinRM ports 5985/5986/47001 keeps basic HTTP probes but
+   skips WhatWeb and directory/vhost searches; other web servers remain eligible.
 5. **Services** — one spawned task per detected service: ssh, ftp, smb, rpc,
    nfs, mysql, postgres, redis, winrm, mssql, smtp, ldap, kerberos, snmp.
    Service detection (`detect_service_ports` in main.rs) matches nmap service
@@ -74,6 +87,10 @@ The pipeline in `run_scan` (`src/main.rs`) runs phases 0–5:
    on 2222) are detected and passed through. LDAP is a task too; right after
    its join, Kerberos is spawned (it needs the discovered domain) and both are
    collected in parallel with the UDP handle; SNMP runs after the UDP join.
+   SMBMap retries a denied null session as guest only when it has no listing,
+   sharing one timeout budget and preserving both outputs and directory paths.
+   MSSQL distinguishes denied logins from client failures even on exit code 0,
+   reports missing/failed NSE details and keeps findings if later login probes fail.
 
 Key architectural patterns — follow them in new code:
 
@@ -87,12 +104,14 @@ Key architectural patterns — follow them in new code:
   the TCP scan and web enumerate too. If `run_scan` still returns `Err`,
   `finalize_report` in `main` writes the report (+ JSON) before propagating.
 - **`runner.rs` is the only place that spawns processes.** Use
-  `run_cmd` / `run_cmd_timeout` / `run_cmd_status` / `run_cmd_tee` /
-  `run_sudo_cmd_timeout`; all wrap `capture_output` (kill_on_drop + timeout,
-  global default timeout from `--timeout`/config), except sudo commands, which
-  run in their own process group via `capture_output_pgroup` so a timeout or
-  abort kills the privileged child too. `tcp_probe` is a native
-  tokio TCP banner grabber — prefer it over shelling out to `nc`.
+  `run_cmd` / `run_cmd_timeout` / `run_cmd_status` / `run_cmd_status_input` /
+  `run_cmd_bytes` / `run_cmd_tee` / `run_sudo_cmd_timeout`. Captured commands
+  share a 16-command semaphore. Ordinary commands have a process-group guard,
+  kill_on_drop and a timeout (global default from `--timeout`/config). Sudo
+  commands run under an internal worker instance of this binary, which kills
+  the privileged process group under its own UID on timeout, signal or parent
+  pipe EOF. `tcp_probe` is a native tokio TCP banner grabber — prefer it over
+  shelling out to `nc`.
 - **Precompiled regexes.** All regexes are module-level
   `static RE_FOO: LazyLock<Regex>`. Never compile a regex inside a loop or
   hot path. A shared `scans::RE_PORT_LINE` filters nmap port lines.
@@ -151,7 +170,8 @@ other file needs editing.
   red), `[-]` hard error. Reports use `report.section("NAME")` +
   `report.add(...)` for text, and `add_port` / `add_service_finding` /
   `add_vuln` / `add_hostname` / `add_next_step` / `add_error` for the JSON
-  side — keep both in sync when adding findings.
+  side — keep both in sync when adding findings. Prefer `add_service(name,
+  text)` for service result lines; it writes to both formats.
 - Comments are English, explanatory, and focus on *why* (often referencing a
   past bug or a tool's quirk). Keep that voice; update stale comments when
   you change behavior.
@@ -177,8 +197,13 @@ sudo; preserve these invariants:
 - **Untrusted local config.** `[tools]` path overrides from `./config.toml`
   are ignored on purpose (`ConfigSource::Local`); only the explicit `--config`
   path and `~/.config/pwnbox/config.toml` may redirect tool binaries.
-- **Atomic writes.** Reports and `/etc/hosts` are written via temp file +
-  rename/install so a kill mid-write never leaves a truncated file.
+- **Atomic writes.** Reports and `/etc/hosts` are written via a sibling temp
+  file + rename so a kill mid-write never leaves a truncated file. For hosts,
+  the privileged worker prepares the sibling in `/etc` before renaming it;
+  `install` alone does not provide an atomic replacement.
+- **Changing box IPs.** Hosts updates remove the requested aliases from old IP
+  entries before assigning them to the current target. Keep unrelated aliases
+  and comments, and resolve conflicts even if the new mapping already exists.
 - **sudo usage.** UDP scan and `/etc/hosts` writes need passwordless sudo;
   both degrade gracefully (warn + continue) when it is absent. `sudo -v` is
   warmed up at scan start via `run_cmd_interactive` (inherited stdio, so the

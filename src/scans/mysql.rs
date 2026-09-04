@@ -19,7 +19,9 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
 
     if !runner::command_exists("mysql").await {
         println!("{} mysql client not found — skipping", "[!]".yellow());
-        report.add("  (mysql client not installed)").await;
+        report
+            .add_service("mysql", "  (mysql client not installed)")
+            .await;
         return Ok(());
     }
 
@@ -106,8 +108,10 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
         let lines: Vec<&str> = output.lines().take(30).collect();
         let text = lines.join("\n");
         println!("{text}");
-        report.add(&format!("  Login: YES ({cred_display})")).await;
-        report.add(&text).await;
+        report
+            .add_service("mysql", &format!("  Login: YES ({cred_display})"))
+            .await;
+        report.add_service("mysql", &text).await;
         report
             .add_vuln(&format!("MySQL: default credentials {cred_display}"))
             .await;
@@ -119,6 +123,8 @@ pub async fn check(ip: &str, port: u16, report: &Report) -> Result<()> {
     }
 
     println!("{} All default credentials denied", "[!]".yellow());
-    report.add("  Default credentials: NO").await;
+    report
+        .add_service("mysql", "  Default credentials: NO")
+        .await;
     Ok(())
 }

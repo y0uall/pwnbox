@@ -25,7 +25,7 @@ pub async fn enumerate(
             "[!]".yellow()
         );
         report
-            .add("  (kerbrute not installed -- install: go install github.com/ropnop/kerbrute@latest)")
+            .add_service("kerberos", "  (kerbrute not installed -- install: go install github.com/ropnop/kerbrute@latest)")
             .await;
         return Ok(());
     }
@@ -58,7 +58,7 @@ pub async fn enumerate(
             println!("{}", line.green().bold());
         }
         let text = valid_lines.join("\n");
-        report.add(&text).await;
+        report.add_service("kerberos", &text).await;
 
         // AS-REP roast the users we just enumerated — needs no credentials and
         // is the obvious continuation the summary's next-steps already promise.
@@ -68,7 +68,7 @@ pub async fn enumerate(
         }
     } else {
         println!("{} No valid users found", "[!]".yellow());
-        report.add("  (no valid users)").await;
+        report.add_service("kerberos", "  (no valid users)").await;
     }
 
     Ok(())
@@ -107,7 +107,10 @@ async fn asrep_roast(domain: &str, ip: &str, users: &[String], raw_dir: &Path, r
             "[!]".yellow()
         );
         report
-            .add("  (impacket-GetNPUsers not installed -- skipping AS-REP roasting)")
+            .add_service(
+                "kerberos",
+                "  (impacket-GetNPUsers not installed -- skipping AS-REP roasting)",
+            )
             .await;
         return;
     };
@@ -176,7 +179,9 @@ async fn asrep_roast(domain: &str, ip: &str, users: &[String], raw_dir: &Path, r
             "{} No AS-REP-roastable accounts (all require pre-auth)",
             "[!]".yellow()
         );
-        report.add("  (no AS-REP-roastable accounts)").await;
+        report
+            .add_service("kerberos", "  (no AS-REP-roastable accounts)")
+            .await;
         return;
     }
 
@@ -186,19 +191,22 @@ async fn asrep_roast(domain: &str, ip: &str, users: &[String], raw_dir: &Path, r
         hashes.len()
     );
     report
-        .add(&format!(
-            "  AS-REP hashes ({}) -- crack with `hashcat -m 18200`:",
-            hashes.len()
-        ))
+        .add_service(
+            "kerberos",
+            &format!(
+                "  AS-REP hashes ({}) -- crack with `hashcat -m 18200`:",
+                hashes.len()
+            ),
+        )
         .await;
     for h in &hashes {
-        report.add(&format!("    {h}")).await;
+        report.add_service("kerberos", &format!("    {h}")).await;
         report
             .add_vuln(&format!("Kerberos: AS-REP roastable account -- {h}"))
             .await;
     }
     report
-        .add(&format!("  (saved: {})", outfile.display()))
+        .add_service("kerberos", &format!("  (saved: {})", outfile.display()))
         .await;
 }
 

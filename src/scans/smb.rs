@@ -63,7 +63,7 @@ async fn probe_enum4linux(ip: &str, bin: &str) -> Result<Option<SmbOutcome>> {
 }
 
 /// smbclient: list shares with a null session. A runner-level failure (spawn
-/// error/timeout) propagates — it did in the serial version, too.
+/// error/timeout) is recorded by the caller without losing other probe results.
 async fn probe_smbclient(ip: &str, bin: &str) -> Result<Option<SmbOutcome>> {
     if !runner::command_exists(bin).await {
         return Ok(None);
@@ -116,7 +116,7 @@ fn cme_report_lines(output: &str) -> Vec<String> {
 /// Keep the useful lines from smbmap's recursive output: accessible-share rows
 /// (READ/WRITE) and the file/dir entries under them (smbmap prints those with a
 /// `dr--r--r--` / `fr--r--r--` permission prefix). Drops banners and NO-ACCESS
-/// noise. Pure so it can be tested against a canned fixture.
+/// noise. Keep directory headings so files retain their parent path.
 fn smbmap_key_lines(output: &str) -> Vec<String> {
     output
         .lines()
@@ -126,6 +126,8 @@ fn smbmap_key_lines(output: &str) -> Vec<String> {
             let up = t.to_uppercase();
             up.contains("READ")
                 || up.contains("WRITE")
+                || t.starts_with("./")
+                || t.starts_with(".\\")
                 || t.starts_with("dr")
                 || t.starts_with("dw")
                 || t.starts_with("fr")
@@ -135,7 +137,15 @@ fn smbmap_key_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// smbmap: recursively spider readable shares with a null session. This is the
+fn smbmap_access_denied(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("access denied")
+        || lower.contains("status_access_denied")
+        || lower.contains("status_logon_failure")
+        || lower.contains("0 authenticated session")
+}
+
+/// smbmap: recursively spider readable shares with null/guest sessions. This is the
 /// real SMB payoff on HTB — the loot is almost always a *file inside* a share
 /// (backup scripts, web.config, an .xml with creds), not the share name that
 /// enum4linux/cme already print. The full listing is saved to raw/ for grepping.
@@ -143,38 +153,60 @@ async fn probe_smbmap(ip: &str, bin: &str, raw_dir: &Path) -> Result<Option<SmbO
     if !runner::command_exists(bin).await {
         return Ok(None);
     }
-    println!("{} smbmap (recursive, null session)...", "[*]".cyan());
-    let output = match runner::run_cmd_timeout(
-        bin,
-        &["-H", ip, "-u", "", "-p", "", "-R", "--depth", "5"],
-        runner::default_timeout().min(120),
-    )
-    .await
-    {
-        Ok(o) => strip_ansi(&o),
-        Err(e) => {
-            println!("{} smbmap failed: {e}", "[!]".yellow());
-            return Ok(Some(SmbOutcome {
-                text: String::new(),
-                error: Some(e.to_string()),
-            }));
+    let started = std::time::Instant::now();
+    let cap = runner::default_timeout().min(120);
+    let mut output = String::new();
+    let mut lines = Vec::new();
+    let mut errors = Vec::new();
+    for user in ["", "guest"] {
+        let label = if user.is_empty() { "null" } else { "guest" };
+        println!("{} smbmap (recursive, {label} session)...", "[*]".cyan());
+        // Both attempts share the same budget. Only retry a denied/unauthenticated
+        // null session with no listing; a transport failure must not double it.
+        let remaining = cap.saturating_sub(started.elapsed().as_secs());
+        if remaining == 0 {
+            errors.push("smbmap session probes exhausted their timeout".to_string());
+            break;
         }
-    };
+        // Current SMBMap uses lowercase -r; the old -R is rejected by argparse.
+        let attempt = match runner::run_cmd_timeout(
+            bin,
+            &["-H", ip, "-u", user, "-p", "", "-r", "--depth", "5"],
+            remaining,
+        )
+        .await
+        {
+            Ok(o) => strip_ansi(&o),
+            Err(e) => {
+                println!("{} smbmap failed: {e}", "[!]".yellow());
+                errors.push(format!("smbmap {label} session: {e}"));
+                break;
+            }
+        };
+        lines.extend(smbmap_key_lines(&attempt));
+        output.push_str(&format!("=== {label} session ===\n{attempt}\n"));
+        if !user.is_empty() || !lines.is_empty() || !smbmap_access_denied(&attempt) {
+            break;
+        }
+    }
 
     // save the full recursive listing before filtering it down for the report
     let path = raw_dir.join("smbmap.txt");
-    let error = tokio::fs::write(&path, &output)
-        .await
-        .err()
-        .map(|e| format!("could not write {}: {e}", path.display()));
+    if !output.is_empty()
+        && let Err(e) = tokio::fs::write(&path, &output).await
+    {
+        errors.push(format!("could not write {}: {e}", path.display()));
+    }
 
-    let mut lines: Vec<String> = smbmap_key_lines(&output).into_iter().take(60).collect();
+    lines.truncate(60);
     if !lines.is_empty() && path.exists() {
         lines.push(format!("  (full listing: {})", path.display()));
+    } else if lines.is_empty() && errors.is_empty() {
+        lines.push("  (smbmap: no share listing available with the tested sessions)".to_string());
     }
     Ok(Some(SmbOutcome {
         text: lines.join("\n"),
-        error,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
     }))
 }
 
@@ -255,24 +287,89 @@ pub async fn enumerate(
         probe_smbmap(ip, &smbmap, raw_dir),
     );
 
-    // apply outcomes in a fixed order — only smbclient's runner error
-    // propagates (it did in the serial version, too)
-    for outcome in [e4l?, smb?, cme?, mapped?].into_iter().flatten() {
+    record_outcomes([e4l, smb, cme, mapped], report).await;
+    Ok(())
+}
+
+async fn record_outcomes(outcomes: [Result<Option<SmbOutcome>>; 4], report: &Report) {
+    // Preserve successful siblings when one tool fails or times out.
+    for outcome in outcomes {
+        let outcome = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => continue,
+            Err(e) => {
+                println!("{} SMB probe failed: {e}", "[!]".yellow());
+                report.add_error("SMB", &e.to_string()).await;
+                continue;
+            }
+        };
         if !outcome.text.is_empty() {
             println!("{}", outcome.text);
-            report.add(&outcome.text).await;
+            report.add_service("smb", &outcome.text).await;
         }
         if let Some(detail) = outcome.error {
             report.add_error("SMB", &detail).await;
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{cme_report_lines, smbmap_key_lines};
+
+    #[tokio::test]
+    async fn smbmap_retries_denied_null_session_as_guest_and_keeps_both_outputs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pwnbox_smbmap_guest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("smbmap-stub");
+        std::fs::write(&bin, r#"#!/bin/sh
+[ "$5" = '-p' ] && [ "$7" = '-r' ] || exit 2
+if [ "$4" = '' ]; then
+    printf '[*] Established 1 SMB connections(s) and 0 authenticated session(s)\n[!] Access denied on 192.0.2.1\n'
+elif [ "$4" = guest ]; then
+    printf 'backups READ ONLY\nfr--r--r-- 609 prod.dtsConfig\n'
+else
+    exit 3
+fi
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = super::probe_smbmap("192.0.2.1", bin.to_str().unwrap(), &dir)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.text.contains("backups READ ONLY"));
+        assert!(result.text.contains("prod.dtsConfig"));
+        let raw = std::fs::read_to_string(dir.join("smbmap.txt")).unwrap();
+        assert!(raw.contains("=== null session ==="));
+        assert!(raw.contains("Access denied"));
+        assert!(raw.contains("=== guest session ==="));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_probe_keeps_other_findings() {
+        let report = crate::report::Report::new();
+        super::record_outcomes(
+            [
+                Ok(Some(super::SmbOutcome {
+                    text: "user: alice".into(),
+                    error: None,
+                })),
+                Err(anyhow::anyhow!("smbclient timed out")),
+                Ok(Some(super::SmbOutcome {
+                    text: "share: backups".into(),
+                    error: None,
+                })),
+                Ok(None),
+            ],
+            &report,
+        )
+        .await;
+        assert_eq!(report.lines().await, vec!["user: alice", "share: backups"]);
+        assert_eq!(report.errors().await, vec!["SMB: smbclient timed out"]);
+    }
 
     #[test]
     fn drops_netexec_first_run_noise() {
@@ -297,7 +394,7 @@ SMB         10.0.0.1      445    DC01  [-] checkpoint.htb\\: STATUS_ACCESS_DENIE
 
     #[test]
     fn smbmap_keeps_accessible_shares_and_files_drops_noise() {
-        // trimmed smbmap -R output: banner + NO ACCESS shares + a readable share
+        // trimmed smbmap -r output: banner + NO ACCESS shares + a readable share
         // with a file entry underneath
         let out = "\
 [+] IP: 10.10.10.3:445\tName: lame.htb
@@ -321,6 +418,11 @@ SMB         10.0.0.1      445    DC01  [-] checkpoint.htb\\: STATUS_ACCESS_DENIE
                 .any(|l| l.contains("tmp") && l.contains("READ, WRITE"))
         );
         assert!(lines.iter().any(|l| l.contains("secret.txt")));
+        assert!(lines.iter().any(|l| l.contains(".\\tmp\\*")));
+        assert_eq!(
+            smbmap_key_lines("\t./backups/config\n"),
+            vec!["\t./backups/config"]
+        );
         assert!(!lines.iter().any(|l| l.contains("NO ACCESS")));
         assert!(!lines.iter().any(|l| l.contains("Remote Admin")));
     }

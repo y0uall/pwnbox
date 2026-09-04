@@ -70,6 +70,15 @@ impl Report {
         lines.push(text.to_string());
     }
 
+    /// Record a service result in both report formats at the call site, so
+    /// positive findings, negative results and tool availability stay in sync.
+    pub async fn add_service(&self, service: &str, text: &str) {
+        self.add(text).await;
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            self.add_service_finding(service, line).await;
+        }
+    }
+
     pub async fn section(&self, title: &str) {
         let mut lines = self.lines.lock().await;
         lines.push(String::new());
@@ -245,6 +254,21 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_results_reach_both_formats() {
+        let r = Report::new();
+        r.add_service("ftp", "  Anonymous login: YES\n  backup.zip")
+            .await;
+        assert_eq!(
+            r.lines().await,
+            vec!["  Anonymous login: YES\n  backup.zip"]
+        );
+        assert_eq!(
+            r.json_mut().await.services["ftp"],
+            vec!["Anonymous login: YES", "backup.zip"]
+        );
+    }
 
     #[tokio::test]
     async fn add_vuln_dedups_repeated_findings() {

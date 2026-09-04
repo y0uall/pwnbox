@@ -37,14 +37,14 @@ pub async fn check_anonymous(
 
     if login_ok {
         println!("{} Anonymous FTP login successful!", "[+]".green());
-        report.add("  Anonymous login: YES").await;
+        report.add_service("ftp", "  Anonymous login: YES").await;
         if !output.trim().is_empty() {
             println!("{output}");
-            report.add(&output).await;
+            report.add_service("ftp", &output).await;
         }
     } else {
         println!("{} Anonymous login failed", "[!]".yellow());
-        report.add("  Anonymous login: NO").await;
+        report.add_service("ftp", "  Anonymous login: NO").await;
     }
 
     Ok(())

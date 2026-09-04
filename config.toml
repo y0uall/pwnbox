@@ -6,7 +6,7 @@
 [defaults]
 timeout = 300          # Global timeout per command (seconds)
 ferox_threads = 50     # Feroxbuster thread count
-fast = false           # Skip UDP, vhost scanning, use smaller wordlists
+fast = false           # TCP + web headers only; skip deep enumeration
 verbose = false        # Show full tool output
 
 [wordlists]
